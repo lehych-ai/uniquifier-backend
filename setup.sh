@@ -12,7 +12,10 @@ REPO="${REPO:-https://github.com/lehych-ai/uniquifier-backend}"
 
 echo "==> system packages"
 apt-get update -y
+# build-essential is required: insightface compiles a Cython extension from
+# source, and the pytorch *-runtime images ship without a compiler (no g++).
 apt-get install -y --no-install-recommends \
+  build-essential python3-dev \
   ffmpeg git wget curl libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev
 
 echo "==> code"
