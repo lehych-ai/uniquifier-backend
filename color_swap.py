@@ -1,416 +1,342 @@
+"""Color swap — rewritten to process every frame instead of stamping frame 0.
+
+The original pipeline edited frame 0 once, then pasted those frozen pixels onto
+every frame through a static mask. On any camera/subject motion that reads as a
+sticker floating in place. This rewrite recomputes a mask **per frame** for all
+three modes, so the edit tracks the moving subject:
+
+  random_color  : per-frame clothing mask (rembg u2net_cloth_seg) + a consistent
+                  hue rotation (chosen once from the seed → temporally stable).
+                  Hue is *rotated*, not flattened, so garment texture survives.
+  random_bg     : background generated once (SD2 inpainting), then per-frame
+                  person matte (feathered + temporally smoothed) composites the
+                  live subject over it.
+  random_clothes: a new garment look is generated once on a reference frame
+                  (SD2 inpainting of the clothing region from the prompt), then
+                  per frame we LAB-transfer that look onto the freshly segmented
+                  clothing region. Motion-correct, no frozen patch.
+
+Full generative garment *replacement* per frame (changing the garment shape, not
+just its look) needs a motion-aware video model — that is the Wan2.1 VACE I2V
+upgrade noted in the project README and is intentionally out of scope here.
+
+Everything degrades gracefully: if a heavy model/weight is missing we fall back
+to a person matte or a plain hue shift rather than crashing.
+"""
+from __future__ import annotations
+
+import logging
+import os
+import random
+from typing import Callable, Optional
+
 import cv2
 import numpy as np
-import os
-import subprocess
-import random
-from rembg import remove
 from PIL import Image
-import torch
-from deep_translator import GoogleTranslator
+
+from video_io import FfmpegWriter, open_video
+
+log = logging.getLogger("gpu.color_swap")
+
+MODELS_DIR = os.environ.get("MODELS_DIR", "/root/models")
+SD_INPAINT_MODEL = os.environ.get("SD_INPAINT_MODEL", "stabilityai/stable-diffusion-2-inpainting")
+
+ProgressCb = Optional[Callable[[float, str], None]]
+
+# ─────────────────────────────────────────
+# lazy singletons
+# ─────────────────────────────────────────
+
+_person_session = None
+_cloth_session = None
+_inpaint_pipe = None
+_translator_ok = True
+
+
+def _get_person_session():
+    global _person_session
+    if _person_session is None:
+        from rembg import new_session
+        _person_session = new_session("u2net")
+    return _person_session
+
+
+def _get_cloth_session():
+    """u2net_cloth_seg segments garments (upper/lower/full). Falls back to None."""
+    global _cloth_session
+    if _cloth_session is None:
+        try:
+            from rembg import new_session
+            _cloth_session = new_session("u2net_cloth_seg")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("cloth-seg model unavailable (%s); using person-band fallback", exc)
+            _cloth_session = False
+    return _cloth_session or None
+
+
+def _get_inpaint_pipe():
+    global _inpaint_pipe
+    if _inpaint_pipe is None:
+        import torch
+        from diffusers import StableDiffusionInpaintPipeline
+
+        _inpaint_pipe = StableDiffusionInpaintPipeline.from_pretrained(
+            SD_INPAINT_MODEL, torch_dtype=torch.float16
+        ).to("cuda")
+        _inpaint_pipe.safety_checker = None
+        log.info("SD inpainting loaded (%s)", SD_INPAINT_MODEL)
+    return _inpaint_pipe
+
+
+def models_status() -> dict:
+    return {"sd_inpaint_model": SD_INPAINT_MODEL}
 
 
 # ─────────────────────────────────────────
-# ПЕРЕВОД ПРОМПТА
+# prompt translation (write prompts in any language)
 # ─────────────────────────────────────────
 
 def translate_prompt(text: str) -> str:
-    """Переводит любой текст в английский"""
-    if not text or not text.strip():
+    global _translator_ok
+    if not text or not text.strip() or not _translator_ok:
         return text
     try:
-        translated = GoogleTranslator(source='auto', target='en').translate(text)
-        print(f"Prompt translated: '{text}' → '{translated}'")
-        return translated
-    except Exception as e:
-        print(f"Translation failed, using original: {e}")
+        from deep_translator import GoogleTranslator
+        return GoogleTranslator(source="auto", target="en").translate(text)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("translate failed: %s", exc)
+        _translator_ok = False
         return text
 
 
 # ─────────────────────────────────────────
-# РАНДОМНЫЕ ФОНЫ
+# masks (per frame)
 # ─────────────────────────────────────────
+
+def _rembg_alpha(session, frame_bgr: np.ndarray) -> np.ndarray:
+    from rembg import remove
+    pil = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+    out = remove(pil, session=session)
+    arr = np.array(out)
+    if arr.ndim == 3 and arr.shape[2] == 4:
+        return arr[:, :, 3]
+    gray = cv2.cvtColor(arr[:, :, :3], cv2.COLOR_RGB2GRAY)
+    return gray
+
+
+def person_mask(frame_bgr: np.ndarray) -> np.ndarray:
+    return _rembg_alpha(_get_person_session(), frame_bgr)
+
+
+def _region_band(h: int, w: int, region: str) -> np.ndarray:
+    band = np.zeros((h, w), np.uint8)
+    if region == "upper":
+        band[int(h * 0.18):int(h * 0.58), :] = 255
+    elif region == "lower":
+        band[int(h * 0.52):int(h * 0.92), :] = 255
+    else:
+        band[int(h * 0.15):int(h * 0.95), :] = 255
+    return band
+
+
+def clothes_mask(frame_bgr: np.ndarray, region: str = "upper") -> np.ndarray:
+    """Per-frame garment mask. Uses cloth-seg if available, else person∩band."""
+    h, w = frame_bgr.shape[:2]
+    band = _region_band(h, w, region)
+    sess = _get_cloth_session()
+    if sess is not None:
+        alpha = _rembg_alpha(sess, frame_bgr)
+        mask = cv2.bitwise_and(alpha, band)
+        if mask.max() > 10:
+            return mask
+    # fallback: person silhouette intersected with the region band
+    pm = person_mask(frame_bgr)
+    return cv2.bitwise_and(pm, band)
+
+
+def _feather(mask: np.ndarray, k: int = 9) -> np.ndarray:
+    m = cv2.GaussianBlur(mask, (0, 0), sigmaX=k)
+    return (m.astype(np.float32) / 255.0)
+
+
+# ─────────────────────────────────────────
+# per-frame operations
+# ─────────────────────────────────────────
+
+def recolor_frame(frame_bgr: np.ndarray, mask: np.ndarray, hue_shift: int, sat_mul: float) -> np.ndarray:
+    """Rotate hue within the masked region (texture-preserving)."""
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV).astype(np.int32)
+    hsv[:, :, 0] = (hsv[:, :, 0] + hue_shift) % 180
+    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * sat_mul, 0, 255)
+    shifted = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+    a = _feather(mask)[..., None]
+    return (shifted * a + frame_bgr * (1 - a)).astype(np.uint8)
+
+
+def composite_person_over_bg(frame_bgr: np.ndarray, bg: np.ndarray, prev_alpha: np.ndarray | None):
+    """Composite the live subject over a static generated background.
+
+    Temporal EMA on the matte tames rembg's per-frame edge flicker.
+    """
+    h, w = frame_bgr.shape[:2]
+    pm = person_mask(frame_bgr).astype(np.float32) / 255.0
+    if prev_alpha is not None and prev_alpha.shape == pm.shape:
+        pm = 0.6 * pm + 0.4 * prev_alpha
+    cur_alpha = pm
+    a = cv2.GaussianBlur(pm, (0, 0), sigmaX=2.0)[..., None]
+    bg_r = cv2.resize(bg, (w, h))
+    out = (frame_bgr.astype(np.float32) * a + bg_r.astype(np.float32) * (1 - a)).astype(np.uint8)
+    return out, cur_alpha
+
+
+def lab_transfer(frame_bgr: np.ndarray, mask: np.ndarray, ref_lab_stats) -> np.ndarray:
+    """Map the masked region's LAB mean/std to the generated garment's stats."""
+    a = _feather(mask)
+    region = a > 0.05
+    if not region.any():
+        return frame_bgr
+    lab = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    (rm, rs) = ref_lab_stats
+    for c in range(3):
+        ch = lab[:, :, c]
+        cm, cs = ch[region].mean(), ch[region].std() + 1e-5
+        ch_new = (ch - cm) / cs * rs[c] + rm[c]
+        lab[:, :, c] = ch_new
+    out = cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+    a3 = a[..., None]
+    return (out * a3 + frame_bgr * (1 - a3)).astype(np.uint8)
+
+
+# ─────────────────────────────────────────
+# generation (once, on a reference frame)
+# ─────────────────────────────────────────
+
+def _sd_inpaint(image_bgr: np.ndarray, mask_255: np.ndarray, prompt: str) -> np.ndarray:
+    pipe = _get_inpaint_pipe()
+    h, w = image_bgr.shape[:2]
+    img = Image.fromarray(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)).resize((512, 512))
+    msk = Image.fromarray(mask_255).resize((512, 512)).convert("RGB")
+    out = pipe(
+        prompt=prompt + ", high quality, photorealistic, detailed",
+        negative_prompt="blurry, low quality, deformed, extra limbs, watermark, text",
+        image=img, mask_image=msk, num_inference_steps=25, guidance_scale=7.5,
+    ).images[0]
+    out = out.resize((w, h), Image.LANCZOS)
+    return cv2.cvtColor(np.array(out), cv2.COLOR_RGB2BGR)
+
 
 RANDOM_BG_PROMPTS = [
     "busy city street with people walking, urban photography",
-    "modern shopping mall interior, bright lights",
     "cozy coffee shop interior, warm lighting",
     "tropical beach with palm trees, sunny day",
-    "green park with trees and benches, daytime",
-    "subway station interior, urban environment",
+    "green park with trees, daytime",
+    "modern shopping mall interior, bright lights",
     "rooftop terrace with city skyline at sunset",
-    "modern gym interior with equipment",
     "luxury hotel lobby, elegant interior",
-    "outdoor market street with colorful stalls",
-    "university campus outdoor area, sunny day",
-    "modern office space with glass windows",
-    "nightclub interior with colored lights",
-    "outdoor basketball court, urban setting",
-    "fashion studio with white background and soft lighting",
+    "fashion studio with soft lighting",
     "concrete urban wall with graffiti, street photography",
-    "airport terminal interior, modern architecture",
-    "restaurant interior with warm ambient lighting",
-    "empty warehouse with industrial aesthetic",
     "mountain landscape with clear blue sky",
 ]
 
-def get_random_bg_prompt() -> str:
-    return random.choice(RANDOM_BG_PROMPTS)
+
+def _lab_stats(image_bgr: np.ndarray, mask: np.ndarray):
+    lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    region = mask > 128
+    if not region.any():
+        region = np.ones(mask.shape, bool)
+    means = [lab[:, :, c][region].mean() for c in range(3)]
+    stds = [lab[:, :, c][region].std() + 1e-5 for c in range(3)]
+    return means, stds
 
 
 # ─────────────────────────────────────────
-# УТИЛИТЫ
+# PREVIEW (frame 0) — also computes the reusable "plan" for the video pass
 # ─────────────────────────────────────────
 
-def load_image_cv(path):
-    return cv2.imread(path)
-
-def save_image_cv(img, path):
-    cv2.imwrite(path, img)
-
-def cv_to_pil(img):
-    return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-
-def pil_to_cv(img):
-    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-
-def save_mask(mask: np.ndarray, path: str):
-    np.save(path, mask)
-
-def load_mask(path: str) -> np.ndarray:
-    return np.load(path)
-
-
-# ─────────────────────────────────────────
-# МОДЕЛИ — загружаются один раз
-# ─────────────────────────────────────────
-
-_sam_predictor = None
-_inpaint_pipe = None
-_ootd = None
-
-def get_sam():
-    global _sam_predictor
-    if _sam_predictor is None:
-        from segment_anything import SamPredictor, sam_model_registry
-        sam = sam_model_registry["vit_h"](
-            checkpoint="/root/models/sam_vit_h_4b8939.pth"
-        )
-        sam.to("cuda")
-        _sam_predictor = SamPredictor(sam)
-        print("SAM loaded")
-    return _sam_predictor
-
-def get_inpaint_pipe():
-    global _inpaint_pipe
-    if _inpaint_pipe is None:
-        from diffusers import StableDiffusionInpaintPipeline
-        _inpaint_pipe = StableDiffusionInpaintPipeline.from_pretrained(
-            "runwayml/stable-diffusion-inpainting",
-            torch_dtype=torch.float16,
-        ).to("cuda")
-        _inpaint_pipe.safety_checker = None
-        print("SD Inpainting loaded")
-    return _inpaint_pipe
-
-def get_ootd():
-    global _ootd
-    if _ootd is None:
-        import sys
-        sys.path.insert(0, "/root/OOTDiffusion")
-        from run_ootd import OOTDiffusion
-        _ootd = OOTDiffusion(gpu_id=0)
-        print("OOTDiffusion loaded")
-    return _ootd
-
-
-# ─────────────────────────────────────────
-# МАСКА ЧЕРЕЗ SAM
-# ─────────────────────────────────────────
-
-def get_mask_sam(image_cv: np.ndarray, region: str = "upper") -> np.ndarray:
-    predictor = get_sam()
-    h, w = image_cv.shape[:2]
-
-    image_rgb = cv2.cvtColor(image_cv, cv2.COLOR_BGR2RGB)
-    predictor.set_image(image_rgb)
-
-    if region == "upper":
-        point = np.array([[w // 2, int(h * 0.38)]])
-    elif region == "lower":
-        point = np.array([[w // 2, int(h * 0.70)]])
-    else:
-        point = np.array([[w // 2, int(h * 0.50)]])
-
-    masks, scores, _ = predictor.predict(
-        point_coords=point,
-        point_labels=np.array([1]),
-        multimask_output=True
-    )
-
-    best = masks[np.argmax(scores)]
-    return (best * 255).astype(np.uint8)
-
-
-def get_person_mask(image_cv: np.ndarray) -> np.ndarray:
-    pil = cv_to_pil(image_cv)
-    removed = remove(pil)
-    alpha = np.array(removed)[:, :, 3]
-    return alpha
-
-
-# ─────────────────────────────────────────
-# RANDOM COLOR
-# ─────────────────────────────────────────
-
-def random_color_shift(image_cv: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    hue = random.randint(0, 179)
-    saturation = random.randint(-30, 30)
-    value = random.randint(-20, 20)
-
-    hsv = cv2.cvtColor(image_cv, cv2.COLOR_BGR2HSV).astype(np.int32)
-    mask_bool = mask > 128
-
-    hsv[mask_bool, 0] = hue
-    hsv[mask_bool, 1] = np.clip(hsv[mask_bool, 1] + saturation, 0, 255)
-    hsv[mask_bool, 2] = np.clip(hsv[mask_bool, 2] + value, 0, 255)
-
-    hsv = hsv.astype(np.uint8)
-    converted = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
-
-    result = image_cv.copy()
-    result[mask_bool] = converted[mask_bool]
-    return result
-
-
-# ─────────────────────────────────────────
-# BACKGROUND SWAP — SD Inpainting
-# ─────────────────────────────────────────
-
-def generate_background_preview(
-    image_cv: np.ndarray,
-) -> tuple:
-    """
-    Каждый раз берёт рандомный промпт из списка.
-    Человек остаётся, фон генерируется новый.
-    """
-    pipe = get_inpaint_pipe()
-    h, w = image_cv.shape[:2]
-
-    # Рандомный фон из списка — каждый раз разный
-    bg_prompt = get_random_bg_prompt()
-    print(f"Background prompt: {bg_prompt}")
-
-    person_mask = get_person_mask(image_cv)
-    bg_mask = cv2.bitwise_not(person_mask)
-
-    pil_image = cv_to_pil(image_cv)
-    pil_mask = Image.fromarray(bg_mask).convert("RGB")
-
-    pil_image_512 = pil_image.resize((512, 512))
-    pil_mask_512 = pil_mask.resize((512, 512))
-
-    negative_prompt = "blurry, low quality, deformed, artifacts, watermark, duplicate person"
-
-    result_pil = pipe(
-        prompt=bg_prompt + ", high quality, photorealistic, 8k",
-        negative_prompt=negative_prompt,
-        image=pil_image_512,
-        mask_image=pil_mask_512,
-        num_inference_steps=25,
-        guidance_scale=7.5,
-    ).images[0]
-
-    result_pil = result_pil.resize((w, h), Image.LANCZOS)
-    result_cv = pil_to_cv(result_pil)
-
-    return result_cv, bg_mask, bg_prompt
-
-
-def apply_background_to_frame(
-    frame_cv: np.ndarray,
-    reference_result: np.ndarray,
-) -> np.ndarray:
-    h, w = frame_cv.shape[:2]
-
-    person_mask = get_person_mask(frame_cv)
-    alpha = person_mask.astype(np.float32) / 255.0
-    alpha_3ch = np.stack([alpha, alpha, alpha], axis=2)
-
-    bg_resized = cv2.resize(reference_result, (w, h))
-
-    result = (
-        frame_cv.astype(np.float32) * alpha_3ch +
-        bg_resized.astype(np.float32) * (1 - alpha_3ch)
-    ).astype(np.uint8)
-
-    return result
-
-
-# ─────────────────────────────────────────
-# CLOTHES SWAP — OOTDiffusion
-# ─────────────────────────────────────────
-
-def generate_clothes_preview(
-    image_cv: np.ndarray,
-    prompt: str,
-    region: str = "upper",
-) -> tuple:
-    # Переводим промпт в английский (можно писать на русском)
-    prompt_en = translate_prompt(prompt)
-    print(f"Clothes prompt (EN): {prompt_en}")
-
-    ootd = get_ootd()
-    pil_image = cv_to_pil(image_cv)
-
-    model_type = {
-        "upper": "half_body",
-        "lower": "lower_body",
-        "full": "full_body",
-    }.get(region, "half_body")
-
-    result_pil = ootd.run(
-        model_type=model_type,
-        image_garm=None,
-        image_vton=pil_image,
-        prompt=prompt_en,
-        n_samples=1,
-        n_steps=20,
-        image_scale=2.0,
-        seed=-1,
-    )[0]
-
-    result_cv = pil_to_cv(result_pil)
-    clothes_mask = get_mask_sam(result_cv, region)
-
-    return result_cv, clothes_mask
-
-
-def apply_clothes_to_frame(
-    frame_cv: np.ndarray,
-    clothes_mask: np.ndarray,
-    reference_result: np.ndarray,
-) -> np.ndarray:
-    h, w = frame_cv.shape[:2]
-
-    mask_resized = cv2.resize(clothes_mask, (w, h))
-    ref_resized = cv2.resize(reference_result, (w, h))
-
-    mask_bool = mask_resized > 128
-    result = frame_cv.copy()
-    result[mask_bool] = ref_resized[mask_bool]
-
-    return result
-
-
-# ─────────────────────────────────────────
-# PREVIEW — первый кадр
-# ─────────────────────────────────────────
-
-def color_swap_preview(
-    frame_path: str,
-    output_path: str,
-    mask_save_path: str,
-    ref_save_path: str,
-    mode: str,
-    region: str,
-    prompt: str = "",
-) -> str:
-    image = load_image_cv(frame_path)
+def color_swap_preview(frame_path, output_path, plan_save_path, mode, region, prompt="", seed=None):
+    """Render the frame-0 preview and persist a small reusable plan (npz)."""
+    image = cv2.imread(frame_path)
+    if image is None:
+        raise ValueError(f"cannot load frame: {frame_path}")
+    rng = random.Random(seed if seed is not None else random.randint(0, 2**31))
 
     if mode == "random_color":
-        mask = get_mask_sam(image, region)
-        result = random_color_shift(image, mask)
-        save_mask(mask, mask_save_path)
-        save_image_cv(result, ref_save_path)
+        hue = rng.randint(40, 140)
+        sat = rng.uniform(1.05, 1.4)
+        mask = clothes_mask(image, region)
+        result = recolor_frame(image, mask, hue, sat)
+        np.savez(plan_save_path, mode=mode, region=region, hue=hue, sat=sat)
 
     elif mode == "random_bg":
-        # Промпт не нужен — берётся рандомный из списка
-        result, bg_mask, used_prompt = generate_background_preview(image)
-        save_mask(bg_mask, mask_save_path)
-        save_image_cv(result, ref_save_path)
+        bg_prompt = rng.choice(RANDOM_BG_PROMPTS)
+        pm = person_mask(image)
+        bg_mask = cv2.bitwise_not(pm)
+        bg = _sd_inpaint(image, bg_mask, bg_prompt)
+        result, _ = composite_person_over_bg(image, bg, None)
+        np.savez(plan_save_path, mode=mode, region=region, bg=bg)
 
     elif mode == "random_clothes":
-        # Промпт пишешь на русском — переводится автоматически
-        result, clothes_mask = generate_clothes_preview(image, prompt, region)
-        save_mask(clothes_mask, mask_save_path)
-        save_image_cv(result, ref_save_path)
+        prompt_en = translate_prompt(prompt) or "new stylish outfit"
+        mask = clothes_mask(image, region)
+        garment = _sd_inpaint(image, mask, prompt_en)
+        means, stds = _lab_stats(garment, mask)
+        result = lab_transfer(image, mask, (means, stds))
+        np.savez(plan_save_path, mode=mode, region=region,
+                 lab_mean=np.array(means), lab_std=np.array(stds))
 
     else:
         result = image
+        np.savez(plan_save_path, mode="none", region=region)
 
-    save_image_cv(result, output_path)
+    cv2.imwrite(output_path, result)
     return output_path
 
 
 # ─────────────────────────────────────────
-# APPLY TO VIDEO
+# APPLY TO VIDEO (per frame)
 # ─────────────────────────────────────────
 
-def color_swap_video(
-    video_path: str,
-    output_path: str,
-    mask_path: str,
-    ref_path: str,
-    mode: str,
-) -> str:
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+def color_swap_video(video_path, output_path, plan_path, on_progress: ProgressCb = None):
+    plan = np.load(plan_path, allow_pickle=True)
+    mode = str(plan["mode"])
+    region = str(plan["region"]) if "region" in plan.files else "upper"
 
-    temp_video = output_path.replace(".mp4", "_noaudio.mp4")
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(temp_video, fourcc, fps, (w, h))
+    cap, meta = open_video(video_path)
+    bg = plan["bg"] if mode == "random_bg" and "bg" in plan.files else None
+    ref_stats = None
+    if mode == "random_clothes":
+        ref_stats = (list(plan["lab_mean"]), list(plan["lab_std"]))
+    hue = int(plan["hue"]) if mode == "random_color" else 0
+    sat = float(plan["sat"]) if mode == "random_color" else 1.0
 
-    mask = load_mask(mask_path)
-    reference = load_image_cv(ref_path)
-
-    frame_idx = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        if mode == "random_color":
-            mask_resized = cv2.resize(mask, (w, h))
-            ref_resized = cv2.resize(reference, (w, h))
-            mask_bool = mask_resized > 128
-            result = frame.copy()
-            result[mask_bool] = ref_resized[mask_bool]
-
-        elif mode == "random_bg":
-            # Фон из референса (сгенерирован один раз на preview)
-            # Человек вырезается из каждого кадра
-            result = apply_background_to_frame(frame, reference)
-
-        elif mode == "random_clothes":
-            result = apply_clothes_to_frame(frame, mask, reference)
-
-        else:
-            result = frame
-
-        out.write(result)
-        frame_idx += 1
-
-        if frame_idx % 30 == 0:
-            progress = round((frame_idx / total_frames) * 100)
-            print(f"Processing: {progress}% ({frame_idx}/{total_frames})")
+    prev_alpha = None
+    with FfmpegWriter(output_path, meta, audio_from=video_path) as writer:
+        idx = 0
+        for frame in _frames(cap):
+            if mode == "random_color":
+                m = clothes_mask(frame, region)
+                out = recolor_frame(frame, m, hue, sat)
+            elif mode == "random_bg":
+                out, prev_alpha = composite_person_over_bg(frame, bg, prev_alpha)
+            elif mode == "random_clothes":
+                m = clothes_mask(frame, region)
+                out = lab_transfer(frame, m, ref_stats)
+            else:
+                out = frame
+            writer.write(out)
+            idx += 1
+            if on_progress and meta.total_frames and idx % 15 == 0:
+                on_progress(idx / meta.total_frames, f"color swap {idx}/{meta.total_frames}")
 
     cap.release()
-    out.release()
-
-    subprocess.run([
-        "ffmpeg", "-y",
-        "-i", temp_video,
-        "-i", video_path,
-        "-c:v", "copy",
-        "-c:a", "aac",
-        "-map", "0:v:0",
-        "-map", "1:a:0",
-        output_path
-    ], capture_output=True)
-
-    os.remove(temp_video)
-    print(f"Done: {output_path}")
+    if on_progress:
+        on_progress(1.0, "done")
     return output_path
+
+
+def _frames(cap):
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        yield frame

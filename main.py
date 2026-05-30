@@ -1,225 +1,249 @@
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import FileResponse
-from fastapi.middleware.cors import CORSMiddleware
-import uuid
+"""CloserAI GPU backend — FastAPI server that runs on a Vast.ai pod.
+
+Contract (consumed by the desktop sidecar's VastBackend):
+
+  GET  /api/status                      -> health + which weights are present
+  POST /api/extract-frame   (video)     -> {video_id, frame_url}
+  POST /api/color-swap-preview (form)   -> image/jpeg  (+ saves a reusable plan)
+  POST /api/color-swap-video  (form)    -> {job_id, status:"started"}
+  POST /api/face-swap-preview (face)    -> image/jpeg
+  POST /api/face-swap-video   (form)    -> {job_id, status:"started"}
+  GET  /api/progress/{video_id}         -> {percent, status, output_url?, error?}
+  GET  /files/{kind}/{name}             -> serve uploaded/generated files
+
+Long jobs run on a background thread and report into PROGRESS so the sidecar can
+poll /api/progress and forward it to the renderer over SSE — no blocking POST.
+
+Set API_TOKEN to require `Authorization: Bearer <token>` on every /api route;
+leave it unset for open access (e.g. behind a private Vast proxy).
+"""
+from __future__ import annotations
+
 import os
+import subprocess
+import threading
+import uuid
 
-app = FastAPI()
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-UPLOAD_DIR = "/tmp/uploads"
-OUTPUT_DIR = "/tmp/outputs"
+UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "/tmp/uploads")
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/tmp/outputs")
+API_TOKEN = os.environ.get("API_TOKEN", "").strip()
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+# video_id -> {"percent": float, "status": str, "output_url": str|None, "error": str|None}
+PROGRESS: dict[str, dict] = {}
+
+app = FastAPI(title="CloserAI GPU backend", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+)
+
+
+def require_token(authorization: str | None = Header(default=None)) -> None:
+    if not API_TOKEN:
+        return
+    if authorization != f"Bearer {API_TOKEN}":
+        raise HTTPException(401, "invalid or missing API token")
+
+
+def _up(video_id: str, name: str) -> str:
+    return os.path.join(UPLOAD_DIR, f"{video_id}_{name}")
+
+
+def _set_progress(video_id: str, percent: float, status: str, **extra) -> None:
+    PROGRESS[video_id] = {"percent": round(percent, 4), "status": status,
+                          "output_url": None, "error": None, **extra}
+
 
 # ─────────────────────────────────────────
-# СТАТУС
+# status / files
 # ─────────────────────────────────────────
 
 @app.get("/api/status")
-async def status():
-    return {"status": "ok"}
-
-
-# ─────────────────────────────────────────
-# ЗАГРУЗКА ВИДЕО + ПЕРВЫЙ КАДР
-# ─────────────────────────────────────────
-
-@app.post("/api/extract-frame")
-async def extract_frame(video: UploadFile = File(...)):
-    video_id = str(uuid.uuid4())
-    video_path = f"{UPLOAD_DIR}/{video_id}.mp4"
-    frame_path = f"{UPLOAD_DIR}/{video_id}_frame0.jpg"
-
-    with open(video_path, "wb") as f:
-        f.write(await video.read())
-
-    os.system(f'ffmpeg -y -i "{video_path}" -vf "select=eq(n\\,0)" -q:v 2 "{frame_path}"')
-
+def status():
+    import face_swap
+    import color_swap
+    gpu = False
+    try:
+        import torch
+        gpu = torch.cuda.is_available()
+    except Exception:
+        pass
     return {
-        "video_id": video_id,
-        "frame_url": f"/files/uploads/{video_id}_frame0.jpg"
+        "status": "ok",
+        "gpu": gpu,
+        "models": {**face_swap.models_status(), **color_swap.models_status()},
+        "auth": bool(API_TOKEN),
     }
 
 
+@app.get("/files/{kind}/{name}")
+def serve_file(kind: str, name: str):
+    base = UPLOAD_DIR if kind == "uploads" else OUTPUT_DIR
+    path = os.path.join(base, name)
+    if not os.path.isfile(path):
+        raise HTTPException(404, "file not found")
+    return FileResponse(path)
+
+
 # ─────────────────────────────────────────
-# COLOR SWAP — PREVIEW
-# Принимает комбинацию тумблеров из UI
+# upload + first frame
 # ─────────────────────────────────────────
+
+@app.post("/api/extract-frame")
+async def extract_frame(video: UploadFile = File(...), _=Depends(require_token)):
+    video_id = uuid.uuid4().hex[:16]
+    video_path = _up(video_id, "src.mp4")
+    frame_path = _up(video_id, "frame0.jpg")
+    with open(video_path, "wb") as f:
+        f.write(await video.read())
+    subprocess.run(
+        ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+         "-i", video_path, "-frames:v", "1", "-q:v", "2", frame_path],
+        check=False,
+    )
+    return {"video_id": video_id, "frame_url": f"/files/uploads/{video_id}_frame0.jpg"}
+
+
+# ─────────────────────────────────────────
+# color swap
+# ─────────────────────────────────────────
+
+def _color_mode(random_color: bool, random_clothes: bool, random_bg: bool) -> str:
+    if random_bg:
+        return "random_bg"
+    if random_clothes:
+        return "random_clothes"
+    return "random_color"
+
+
+def _color_region(upper: bool, lower: bool, full: bool) -> str:
+    if full:
+        return "full"
+    if lower:
+        return "lower"
+    return "upper"
+
 
 @app.post("/api/color-swap-preview")
-async def api_color_swap_preview(
+def color_swap_preview_route(
     video_id: str = Form(...),
-
-    # Тумблеры первой строки
     random_color: bool = Form(False),
     random_clothes: bool = Form(False),
     random_bg: bool = Form(False),
-
-    # Тумблеры второй строки
     upper_clothes: bool = Form(False),
     lower_clothes: bool = Form(False),
     full_outfit: bool = Form(False),
-
-    # Промпты
     prompt_upper: str = Form(""),
     prompt_lower: str = Form(""),
     prompt_full: str = Form(""),
+    seed: int | None = Form(None),
+    _=Depends(require_token),
 ):
     from color_swap import color_swap_preview
 
-    frame_path = f"{UPLOAD_DIR}/{video_id}_frame0.jpg"
-    output_path = f"{OUTPUT_DIR}/{video_id}_color_preview.jpg"
-    mask_path = f"{UPLOAD_DIR}/{video_id}_mask.npy"
-    ref_path = f"{UPLOAD_DIR}/{video_id}_ref.jpg"
+    mode = _color_mode(random_color, random_clothes, random_bg)
+    region = _color_region(upper_clothes, lower_clothes, full_outfit)
+    prompt = {"upper": prompt_upper, "lower": prompt_lower, "full": prompt_full}[region]
 
-    # Определяем режим
-    if random_bg:
-        mode = "random_bg"
-        region = "full"
-        prompt = ""
-    elif random_clothes:
-        mode = "random_clothes"
-        if upper_clothes:
-            region = "upper"
-            prompt = prompt_upper
-        elif lower_clothes:
-            region = "lower"
-            prompt = prompt_lower
-        else:
-            region = "full"
-            prompt = prompt_full
-    else:
-        # random_color
-        mode = "random_color"
-        if upper_clothes:
-            region = "upper"
-        elif lower_clothes:
-            region = "lower"
-        else:
-            region = "full"
-        prompt = ""
-
+    out = _up(video_id, "color_preview.jpg")
+    plan = _up(video_id, "color_plan.npz")
     color_swap_preview(
-        frame_path=frame_path,
-        output_path=output_path,
-        mask_save_path=mask_path,
-        ref_save_path=ref_path,
-        mode=mode,
-        region=region,
-        prompt=prompt,
+        frame_path=_up(video_id, "frame0.jpg"),
+        output_path=out,
+        plan_save_path=plan,
+        mode=mode, region=region, prompt=prompt, seed=seed,
     )
+    return FileResponse(out, media_type="image/jpeg")
 
-    return FileResponse(output_path, media_type="image/jpeg")
-
-
-# ─────────────────────────────────────────
-# COLOR SWAP — APPLY TO VIDEO
-# ─────────────────────────────────────────
 
 @app.post("/api/color-swap-video")
-async def api_color_swap_video(
-    video_id: str = Form(...),
-    random_color: bool = Form(False),
-    random_clothes: bool = Form(False),
-    random_bg: bool = Form(False),
-):
+def color_swap_video_route(video_id: str = Form(...), _=Depends(require_token)):
     from color_swap import color_swap_video
 
-    video_path = f"{UPLOAD_DIR}/{video_id}.mp4"
-    output_path = f"{OUTPUT_DIR}/{video_id}_color_result.mp4"
-    mask_path = f"{UPLOAD_DIR}/{video_id}_mask.npy"
-    ref_path = f"{UPLOAD_DIR}/{video_id}_ref.jpg"
+    src = _up(video_id, "src.mp4")
+    plan = _up(video_id, "color_plan.npz")
+    if not os.path.isfile(plan):
+        raise HTTPException(400, "run color-swap-preview first (no plan found)")
+    out = os.path.join(OUTPUT_DIR, f"{video_id}_color.mp4")
+    job_id = uuid.uuid4().hex[:12]
 
-    if random_bg:
-        mode = "random_bg"
-    elif random_clothes:
-        mode = "random_clothes"
-    else:
-        mode = "random_color"
+    def work():
+        _set_progress(video_id, 0.0, "running")
+        try:
+            color_swap_video(src, out, plan,
+                             on_progress=lambda p, m: _set_progress(video_id, p, "running"))
+            PROGRESS[video_id] = {"percent": 1.0, "status": "done",
+                                  "output_url": f"/files/outputs/{video_id}_color.mp4", "error": None}
+        except Exception as exc:  # noqa: BLE001
+            PROGRESS[video_id] = {"percent": 0.0, "status": "failed", "output_url": None, "error": str(exc)}
 
-    color_swap_video(
-        video_path=video_path,
-        output_path=output_path,
-        mask_path=mask_path,
-        ref_path=ref_path,
-        mode=mode,
-    )
-
-    return {"output_url": f"/files/outputs/{video_id}_color_result.mp4"}
+    threading.Thread(target=work, daemon=True).start()
+    return {"job_id": job_id, "video_id": video_id, "status": "started"}
 
 
 # ─────────────────────────────────────────
-# FACE SWAP — PREVIEW
+# face swap
 # ─────────────────────────────────────────
 
 @app.post("/api/face-swap-preview")
-async def api_face_swap_preview(
+async def face_swap_preview_route(
     video_id: str = Form(...),
     swap_all: bool = Form(False),
+    enhance: bool = Form(True),
     face: UploadFile = File(...),
+    _=Depends(require_token),
 ):
     from face_swap import face_swap_preview
 
-    frame_path = f"{UPLOAD_DIR}/{video_id}_frame0.jpg"
-    face_path = f"{UPLOAD_DIR}/{video_id}_face.jpg"
-    output_path = f"{OUTPUT_DIR}/{video_id}_face_preview.jpg"
-
+    face_path = _up(video_id, "face.jpg")
     with open(face_path, "wb") as f:
         f.write(await face.read())
+    out = _up(video_id, "face_preview.jpg")
+    face_swap_preview(_up(video_id, "frame0.jpg"), face_path, out, swap_all=swap_all, enhance=enhance)
+    return FileResponse(out, media_type="image/jpeg")
 
-    face_swap_preview(
-        frame_path=frame_path,
-        face_path=face_path,
-        output_path=output_path,
-        swap_all=swap_all,
-    )
-
-    return FileResponse(output_path, media_type="image/jpeg")
-
-
-# ─────────────────────────────────────────
-# FACE SWAP — APPLY TO VIDEO
-# ─────────────────────────────────────────
 
 @app.post("/api/face-swap-video")
-async def api_face_swap_video(
+def face_swap_video_route(
     video_id: str = Form(...),
     swap_all: bool = Form(False),
     skip_frames: int = Form(0),
+    enhance: bool = Form(True),
+    _=Depends(require_token),
 ):
     from face_swap import face_swap_video
 
-    video_path = f"{UPLOAD_DIR}/{video_id}.mp4"
-    face_path = f"{UPLOAD_DIR}/{video_id}_face.jpg"
-    output_path = f"{OUTPUT_DIR}/{video_id}_face_result.mp4"
+    src = _up(video_id, "src.mp4")
+    face_path = _up(video_id, "face.jpg")
+    if not os.path.isfile(face_path):
+        raise HTTPException(400, "run face-swap-preview first (no face uploaded)")
+    out = os.path.join(OUTPUT_DIR, f"{video_id}_face.mp4")
+    job_id = uuid.uuid4().hex[:12]
 
-    face_swap_video(
-        video_path=video_path,
-        face_path=face_path,
-        output_path=output_path,
-        swap_all=swap_all,
-        skip_frames=skip_frames,
-    )
+    def work():
+        _set_progress(video_id, 0.0, "running")
+        try:
+            face_swap_video(src, face_path, out, swap_all=swap_all, skip_frames=skip_frames,
+                            enhance=enhance,
+                            on_progress=lambda p, m: _set_progress(video_id, p, "running"))
+            PROGRESS[video_id] = {"percent": 1.0, "status": "done",
+                                  "output_url": f"/files/outputs/{video_id}_face.mp4", "error": None}
+        except Exception as exc:  # noqa: BLE001
+            PROGRESS[video_id] = {"percent": 0.0, "status": "failed", "output_url": None, "error": str(exc)}
 
-    return {"output_url": f"/files/outputs/{video_id}_face_result.mp4"}
+    threading.Thread(target=work, daemon=True).start()
+    return {"job_id": job_id, "video_id": video_id, "status": "started"}
 
 
 # ─────────────────────────────────────────
-# ОТДАЁМ ФАЙЛЫ
+# progress
 # ─────────────────────────────────────────
 
-@app.get("/files/uploads/{filename}")
-async def get_upload(filename: str):
-    return FileResponse(f"{UPLOAD_DIR}/{filename}")
-
-@app.get("/files/outputs/{filename}")
-async def get_output(filename: str):
-    return FileResponse(f"{OUTPUT_DIR}/{filename}")
+@app.get("/api/progress/{video_id}")
+def progress(video_id: str, _=Depends(require_token)):
+    return PROGRESS.get(video_id, {"percent": 0.0, "status": "unknown", "output_url": None, "error": None})

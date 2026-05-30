@@ -1,171 +1,78 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+# Provision a Vast.ai (or any CUDA) pod for the CloserAI GPU backend.
+# Idempotent: safe to re-run. Honors env overrides:
+#   MODELS_DIR (default /root/models), APP_DIR (default /root/app),
+#   PORT (default 8000), API_TOKEN (optional), SD_INPAINT_MODEL.
+set -euo pipefail
 
-echo "================================================"
-echo "=== UNIQUIFIER BACKEND SETUP ==="
-echo "================================================"
+MODELS_DIR="${MODELS_DIR:-/root/models}"
+APP_DIR="${APP_DIR:-/root/app}"
+PORT="${PORT:-8000}"
+REPO="${REPO:-https://github.com/lehych-ai/uniquifier-backend}"
 
+echo "==> system packages"
+apt-get update -y
+apt-get install -y --no-install-recommends \
+  ffmpeg git wget curl libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev
 
-# ─────────────────────────────────────────
-# ШАГ 1 — СИСТЕМНЫЕ ПАКЕТЫ
-# ─────────────────────────────────────────
-
-echo ""
-echo "=== [1/6] Installing system packages ==="
-apt-get update -q
-apt-get install -y -q \
-    ffmpeg \
-    git \
-    wget \
-    curl \
-    libgl1 \
-    libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender-dev
-
-
-# ─────────────────────────────────────────
-# ШАГ 2 — КЛОНИРУЕМ РЕПО
-# ─────────────────────────────────────────
-
-echo ""
-echo "=== [2/6] Cloning repo ==="
-cd /root
-
-if [ -d "uniquifier-backend" ]; then
-    echo "Repo exists, pulling latest..."
-    cd uniquifier-backend
-    git pull
+echo "==> code"
+if [ -d "$APP_DIR/.git" ]; then
+  git -C "$APP_DIR" pull --ff-only || true
 else
-    git clone https://github.com/ТВОЙ_ЮЗЕР/uniquifier-backend.git
-    cd uniquifier-backend
+  git clone --depth 1 "$REPO" "$APP_DIR"
 fi
+cd "$APP_DIR"
+# If this script lives in a gpu-backend/ subdir of the desktop repo, use that.
+[ -f "$APP_DIR/gpu-backend/main.py" ] && cd "$APP_DIR/gpu-backend"
 
+echo "==> python deps"
+pip install --upgrade pip
+pip install -r requirements.txt
 
-# ─────────────────────────────────────────
-# ШАГ 3 — PYTHON БИБЛИОТЕКИ
-# ─────────────────────────────────────────
+echo "==> model weights -> $MODELS_DIR"
+mkdir -p "$MODELS_DIR"
 
-echo ""
-echo "=== [3/6] Installing Python packages ==="
+dl() {  # dl <url> <dest>
+  if [ ! -f "$2" ]; then
+    echo "    downloading $(basename "$2")"
+    wget -q --show-progress -O "$2" "$1"
+  else
+    echo "    have $(basename "$2")"
+  fi
+}
 
-pip install --upgrade pip -q
-pip install -r requirements.txt -q
+# Face swap: inswapper (~500MB) + GFPGAN restorer (~340MB)
+dl "https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx" \
+   "$MODELS_DIR/inswapper_128.onnx"
+dl "https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth" \
+   "$MODELS_DIR/GFPGANv1.4.pth"
 
-# segment-anything с GitHub
-pip install git+https://github.com/facebookresearch/segment-anything.git -q
+# Warm rembg model cache (person matte + clothes segmentation)
+echo "==> warming rembg models"
+python - <<'PY'
+try:
+    from rembg import new_session
+    new_session("u2net")
+    new_session("u2net_cloth_seg")
+    print("    rembg models cached")
+except Exception as e:
+    print("    rembg warm failed (will lazy-load):", e)
+PY
 
-# diffusers для SD Inpainting
-pip install diffusers transformers accelerate xformers -q
-
-# Кешируем buffalo_l для InsightFace
-python -c "
-from insightface.app import FaceAnalysis
-app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider'])
-app.prepare(ctx_id=0, det_size=(640, 640))
-print('buffalo_l ready')
-"
-
-
-# ─────────────────────────────────────────
-# ШАГ 4 — OOTDIFFUSION
-# ─────────────────────────────────────────
-
-echo ""
-echo "=== [4/6] Setting up OOTDiffusion ==="
-
-if [ ! -d "/root/OOTDiffusion" ]; then
-    git clone https://github.com/levihsu/OOTDiffusion.git /root/OOTDiffusion
-fi
-
-cd /root/OOTDiffusion
-pip install -r requirements.txt -q
-
-# Скачиваем веса OOTDiffusion с HuggingFace (~7gb)
-python -c "
-from huggingface_hub import snapshot_download
-snapshot_download(
-    'levihsu/OOTDiffusion',
-    local_dir='/root/OOTDiffusion/checkpoints',
-    ignore_patterns=['*.msgpack', '*.h5']
-)
-print('OOTDiffusion weights ready')
-"
-
-cd /root/uniquifier-backend
-
-
-# ─────────────────────────────────────────
-# ШАГ 5 — СКАЧИВАЕМ МОДЕЛИ
-# ─────────────────────────────────────────
-
-echo ""
-echo "=== [5/6] Downloading models ==="
-
-mkdir -p /root/models
-
-# Face swap
-if [ ! -f "/root/models/inswapper_128.onnx" ]; then
-    echo "Downloading inswapper_128.onnx (~500mb)..."
-    wget -q --show-progress \
-        "https://huggingface.co/deepinsight/inswapper/resolve/main/inswapper_128.onnx" \
-        -O /root/models/inswapper_128.onnx
-else
-    echo "inswapper_128.onnx exists, skipping"
-fi
-
-# SAM
-if [ ! -f "/root/models/sam_vit_h_4b8939.pth" ]; then
-    echo "Downloading SAM vit_h (~2.4gb)..."
-    wget -q --show-progress \
-        "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth" \
-        -O /root/models/sam_vit_h_4b8939.pth
-else
-    echo "SAM exists, skipping"
-fi
-
-# SD Inpainting — кешируем веса с HuggingFace (~4gb)
-python -c "
-from diffusers import StableDiffusionInpaintPipeline
-import torch
-pipe = StableDiffusionInpaintPipeline.from_pretrained(
-    'runwayml/stable-diffusion-inpainting',
-    torch_dtype=torch.float16,
-)
-print('SD Inpainting weights cached')
-"
-
-# rembg u2net
-python -c "
-from rembg import remove
-from PIL import Image
-import numpy as np
-img = Image.fromarray(np.zeros((64,64,3), dtype=np.uint8))
-remove(img)
-print('rembg u2net ready')
-"
-
-
-# ─────────────────────────────────────────
-# ШАГ 6 — ЗАПУСК
-# ─────────────────────────────────────────
-
-echo ""
-echo "=== [6/6] Starting server ==="
+# Pre-fetch SD inpainting weights (maintained model; runwayml one was unpublished)
+echo "==> prefetch SD inpainting (${SD_INPAINT_MODEL:-stabilityai/stable-diffusion-2-inpainting})"
+python - <<'PY'
+import os
+mid = os.environ.get("SD_INPAINT_MODEL", "stabilityai/stable-diffusion-2-inpainting")
+try:
+    from huggingface_hub import snapshot_download
+    snapshot_download(mid, allow_patterns=["*.json","*.txt","*.fp16.safetensors","*.safetensors"])
+    print("    cached", mid)
+except Exception as e:
+    print("    SD prefetch skipped (will lazy-load):", e)
+PY
 
 mkdir -p /tmp/uploads /tmp/outputs
 
-cd /root/uniquifier-backend
-
-echo ""
-echo "================================================"
-echo "Server running on port 8000"
-echo "================================================"
-echo ""
-
-uvicorn main:app \
-    --host 0.0.0.0 \
-    --port 8000 \
-    --workers 1 \
-    --log-level info
+echo "==> launching API on :$PORT"
+exec uvicorn main:app --host 0.0.0.0 --port "$PORT" --workers 1 --log-level info

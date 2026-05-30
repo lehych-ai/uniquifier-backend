@@ -1,175 +1,219 @@
+"""Face swap — InsightFace inswapper_128 + optional GFPGAN restoration.
+
+What changed vs. the original:
+  1. Optional GFPGAN face enhancer. inswapper_128 emits a 128x128 face; on HD
+     footage that reads as a soft, low-res patch. Roop/FaceFusion always pair it
+     with a restorer. We load GFPGAN if its weights are present and run it on the
+     swapped result; if not present we degrade gracefully (no crash).
+  2. Fixed `skip_frames`. The old code wrote the *entire previous frame* on
+     skipped frames, freezing the whole picture (background + body), which looks
+     like a 15fps stutter. Now skipped frames keep the live frame and only the
+     cached swapped *face* is re-pasted at the current detected box.
+  3. Real libx264 output via the ffmpeg pipe (see video_io), not mp4v.
+"""
+from __future__ import annotations
+
+import logging
+import os
+from typing import Callable, Optional
+
 import cv2
 import numpy as np
-import os
-import subprocess
-import insightface
 from insightface.app import FaceAnalysis
 from insightface.model_zoo import get_model
 
+from video_io import FfmpegWriter, open_video
 
-# ─────────────────────────────────────────
-# ИНИЦИАЛИЗАЦИЯ МОДЕЛЕЙ (один раз)
-# ─────────────────────────────────────────
+log = logging.getLogger("gpu.face_swap")
 
-_face_analyzer = None
-_face_swapper = None
+MODELS_DIR = os.environ.get("MODELS_DIR", "/root/models")
+INSWAPPER_PATH = os.path.join(MODELS_DIR, "inswapper_128.onnx")
+GFPGAN_PATH = os.path.join(MODELS_DIR, "GFPGANv1.4.pth")
+PROVIDERS = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+ProgressCb = Optional[Callable[[float, str], None]]
+
+_analyzer = None
+_swapper = None
+_enhancer: object | None = None
+_enhancer_tried = False
+
 
 def get_models():
-    global _face_analyzer, _face_swapper
+    global _analyzer, _swapper
+    if _analyzer is None:
+        log.info("loading FaceAnalysis (buffalo_l)…")
+        _analyzer = FaceAnalysis(name="buffalo_l", providers=PROVIDERS)
+        _analyzer.prepare(ctx_id=0, det_size=(640, 640))
+    if _swapper is None:
+        log.info("loading inswapper_128…")
+        _swapper = get_model(INSWAPPER_PATH, providers=PROVIDERS)
+    return _analyzer, _swapper
 
-    if _face_analyzer is None:
-        print("Loading FaceAnalysis model...")
-        _face_analyzer = FaceAnalysis(
-            name="buffalo_l",
-            providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+def get_enhancer():
+    """Lazy-load GFPGAN. Returns None (and logs once) if unavailable."""
+    global _enhancer, _enhancer_tried
+    if _enhancer_tried:
+        return _enhancer
+    _enhancer_tried = True
+    if not os.path.isfile(GFPGAN_PATH):
+        log.warning("GFPGAN weights not found at %s — running without enhancer", GFPGAN_PATH)
+        return None
+    try:
+        from gfpgan import GFPGANer
+
+        _enhancer = GFPGANer(
+            model_path=GFPGAN_PATH,
+            upscale=1,
+            arch="clean",
+            channel_multiplier=2,
+            bg_upsampler=None,
         )
-        _face_analyzer.prepare(ctx_id=0, det_size=(640, 640))
+        log.info("GFPGAN enhancer loaded")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("GFPGAN load failed (%s) — running without enhancer", exc)
+        _enhancer = None
+    return _enhancer
 
-    if _face_swapper is None:
-        print("Loading inswapper_128 model...")
-        _face_swapper = get_model(
-            "/root/models/inswapper_128.onnx",
-            providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
-        )
 
-    return _face_analyzer, _face_swapper
+def models_status() -> dict:
+    return {
+        "inswapper": os.path.isfile(INSWAPPER_PATH),
+        "gfpgan": os.path.isfile(GFPGAN_PATH),
+    }
 
 
 # ─────────────────────────────────────────
-# УТИЛИТЫ
+# detection / swap
 # ─────────────────────────────────────────
 
 def detect_faces(analyzer, image: np.ndarray):
     faces = analyzer.get(image)
-    # Сортируем — самое большое лицо первым
-    faces = sorted(faces, key=lambda x: x.bbox[2] - x.bbox[0], reverse=True)
-    return faces
+    return sorted(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]), reverse=True)
+
 
 def get_source_face(analyzer, face_image_path: str):
     img = cv2.imread(face_image_path)
     if img is None:
-        raise ValueError(f"Cannot load face image: {face_image_path}")
-
+        raise ValueError(f"cannot load face image: {face_image_path}")
     faces = detect_faces(analyzer, img)
     if not faces:
-        raise ValueError("No face detected in source image")
-
+        raise ValueError("no face detected in the source photo")
     return faces[0]
 
 
-# ─────────────────────────────────────────
-# SWAP ОДНОГО ИЗОБРАЖЕНИЯ
-# ─────────────────────────────────────────
+def _enhance(image: np.ndarray) -> np.ndarray:
+    enhancer = get_enhancer()
+    if enhancer is None:
+        return image
+    try:
+        _, _, restored = enhancer.enhance(image, has_aligned=False, only_center_face=False, paste_back=True)
+        return restored if restored is not None else image
+    except Exception as exc:  # noqa: BLE001
+        log.debug("enhance failed: %s", exc)
+        return image
 
-def swap_single_image(
-    image: np.ndarray,
-    source_face,
-    analyzer,
-    swapper,
-    swap_all: bool = False,
-) -> np.ndarray:
+
+def swap_single_image(image, source_face, analyzer, swapper, swap_all=False, enhance=True):
     target_faces = detect_faces(analyzer, image)
-
     if not target_faces:
-        return image  # нет лица — возвращаем оригинал
-
+        return image, []
     result = image.copy()
+    targets = target_faces if swap_all else target_faces[:1]
+    for face in targets:
+        result = swapper.get(result, face, source_face, paste_back=True)
+    if enhance:
+        result = _enhance(result)
+    boxes = [f.bbox.astype(int) for f in targets]
+    return result, boxes
 
-    if swap_all:
-        for face in target_faces:
-            result = swapper.get(result, face, source_face, paste_back=True)
-    else:
-        result = swapper.get(result, target_faces[0], source_face, paste_back=True)
 
-    return result
-
-
-# ─────────────────────────────────────────
-# PREVIEW — первый кадр
-# ─────────────────────────────────────────
-
-def face_swap_preview(
-    frame_path: str,
-    face_path: str,
-    output_path: str,
-    swap_all: bool = False,
-) -> str:
+def face_swap_preview(frame_path, face_path, output_path, swap_all=False, enhance=True):
     analyzer, swapper = get_models()
-
     frame = cv2.imread(frame_path)
+    if frame is None:
+        raise ValueError(f"cannot load frame: {frame_path}")
     source_face = get_source_face(analyzer, face_path)
-
-    result = swap_single_image(frame, source_face, analyzer, swapper, swap_all)
-
+    result, _ = swap_single_image(frame, source_face, analyzer, swapper, swap_all, enhance)
     cv2.imwrite(output_path, result)
-    print(f"Preview saved: {output_path}")
     return output_path
 
 
 # ─────────────────────────────────────────
-# APPLY TO VIDEO
+# video
 # ─────────────────────────────────────────
+
+def _paste_face(dst: np.ndarray, cached: np.ndarray, box) -> np.ndarray:
+    """Paste a cached swapped-face crop into `dst` at the current bbox, feathered.
+
+    Used on skipped frames so the body/background stay live while the (already
+    swapped) face simply follows the head — far better than freezing the frame.
+    """
+    x1, y1, x2, y2 = [int(v) for v in box]
+    h, w = dst.shape[:2]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w, x2), min(h, y2)
+    if x2 <= x1 or y2 <= y1:
+        return dst
+    patch = cv2.resize(cached, (x2 - x1, y2 - y1))
+    mask = np.zeros((y2 - y1, x2 - x1), np.float32)
+    cv2.ellipse(mask, ((x2 - x1) // 2, (y2 - y1) // 2), ((x2 - x1) // 2, (y2 - y1) // 2), 0, 0, 360, 1.0, -1)
+    mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=max(2, (x2 - x1) // 12))[..., None]
+    dst[y1:y2, x1:x2] = (patch * mask + dst[y1:y2, x1:x2] * (1 - mask)).astype(np.uint8)
+    return dst
+
 
 def face_swap_video(
-    video_path: str,
-    face_path: str,
-    output_path: str,
-    swap_all: bool = False,
-    skip_frames: int = 0,
-) -> str:
+    video_path,
+    face_path,
+    output_path,
+    swap_all=False,
+    skip_frames=0,
+    enhance=True,
+    on_progress: ProgressCb = None,
+):
     analyzer, swapper = get_models()
-
-    # Загружаем лицо один раз
     source_face = get_source_face(analyzer, face_path)
 
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap, meta = open_video(video_path)
+    cached_face_crop: np.ndarray | None = None
+    cached_box = None
 
-    temp_video = output_path.replace(".mp4", "_noaudio.mp4")
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(temp_video, fourcc, fps, (w, h))
+    with FfmpegWriter(output_path, meta, audio_from=video_path) as writer:
+        idx = 0
+        for frame in _frames(cap):
+            heavy = skip_frames <= 0 or idx % (skip_frames + 1) == 0
+            if heavy:
+                result, boxes = swap_single_image(frame, source_face, analyzer, swapper, swap_all, enhance)
+                if boxes:
+                    bx = boxes[0]
+                    x1, y1, x2, y2 = [int(v) for v in bx]
+                    x1, y1 = max(0, x1), max(0, y1)
+                    cached_face_crop = result[y1:y2, x1:x2].copy()
+                    cached_box = bx
+                writer.write(result)
+            elif cached_face_crop is not None:
+                # light frame: re-detect (cheap) to follow the head, paste cached face
+                faces = detect_faces(analyzer, frame)
+                box = faces[0].bbox if faces else cached_box
+                writer.write(_paste_face(frame.copy(), cached_face_crop, box))
+            else:
+                writer.write(frame)
 
-    frame_idx = 0
-    last_result = None
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        # skip_frames=1 → каждый второй кадр берём из предыдущего
-        # Ускоряет в 2x, почти незаметно на видео
-        if skip_frames > 0 and frame_idx % (skip_frames + 1) != 0 and last_result is not None:
-            out.write(last_result)
-        else:
-            result = swap_single_image(frame, source_face, analyzer, swapper, swap_all)
-            out.write(result)
-            last_result = result
-
-        frame_idx += 1
-
-        if frame_idx % 30 == 0:
-            progress = round((frame_idx / total_frames) * 100)
-            print(f"Face swap: {progress}% ({frame_idx}/{total_frames})")
+            idx += 1
+            if on_progress and meta.total_frames and idx % 15 == 0:
+                on_progress(idx / meta.total_frames, f"face swap {idx}/{meta.total_frames}")
 
     cap.release()
-    out.release()
-
-    # Возвращаем звук
-    subprocess.run([
-        "ffmpeg", "-y",
-        "-i", temp_video,
-        "-i", video_path,
-        "-c:v", "copy",
-        "-c:a", "aac",
-        "-map", "0:v:0",
-        "-map", "1:a:0",
-        output_path
-    ], capture_output=True)
-
-    os.remove(temp_video)
-    print(f"Done: {output_path}")
+    if on_progress:
+        on_progress(1.0, "done")
     return output_path
+
+
+def _frames(cap):
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        yield frame
