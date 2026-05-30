@@ -62,20 +62,33 @@ except Exception as e:
     print("    rembg warm failed (will lazy-load):", e)
 PY
 
-# Pre-fetch SD inpainting weights (maintained model; runwayml one was unpublished)
-echo "==> prefetch SD inpainting (${SD_INPAINT_MODEL:-stabilityai/stable-diffusion-2-inpainting})"
+# Pre-fetch SD inpainting weights. stabilityai/* went gated (HTTP 401), so use a
+# public SD1.5-inpainting mirror by default. Non-fatal — falls back to lazy load.
+SD_INPAINT_MODEL="${SD_INPAINT_MODEL:-botp/stable-diffusion-v1-5-inpainting}"
+export SD_INPAINT_MODEL
+echo "==> prefetch SD inpainting (${SD_INPAINT_MODEL})"
 python - <<'PY'
 import os
-mid = os.environ.get("SD_INPAINT_MODEL", "stabilityai/stable-diffusion-2-inpainting")
+mid = os.environ.get("SD_INPAINT_MODEL")
 try:
     from huggingface_hub import snapshot_download
-    snapshot_download(mid, allow_patterns=["*.json","*.txt","*.fp16.safetensors","*.safetensors"])
+    snapshot_download(mid, allow_patterns=["*.json","*.txt","*.safetensors","*.bin"])
     print("    cached", mid)
 except Exception as e:
     print("    SD prefetch skipped (will lazy-load):", e)
 PY
 
 mkdir -p /tmp/uploads /tmp/outputs
+
+# onnxruntime-gpu needs libcudnn.so.8 / libcublas, which this image keeps inside
+# torch/conda rather than on the default loader path → "libcudnn.so.8: cannot
+# open shared object file". Locate them and export LD_LIBRARY_PATH before launch.
+echo "==> wiring cuDNN onto LD_LIBRARY_PATH for onnxruntime"
+CUDNN_LIB="$(find /opt/conda -name 'libcudnn.so.8*' 2>/dev/null | head -1)"
+TORCH_LIB="$(python -c 'import torch,os;print(os.path.join(os.path.dirname(torch.__file__),"lib"))' 2>/dev/null || true)"
+export LD_LIBRARY_PATH="${CUDNN_LIB:+$(dirname "$CUDNN_LIB")}:${TORCH_LIB}:/opt/conda/lib:${LD_LIBRARY_PATH:-}"
+echo "    cudnn=$CUDNN_LIB"
+echo "    LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
 
 echo "==> launching API on :$PORT"
 exec uvicorn main:app --host 0.0.0.0 --port "$PORT" --workers 1 --log-level info

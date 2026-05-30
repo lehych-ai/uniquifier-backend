@@ -39,7 +39,8 @@ from video_io import FfmpegWriter, open_video
 log = logging.getLogger("gpu.color_swap")
 
 MODELS_DIR = os.environ.get("MODELS_DIR", "/root/models")
-SD_INPAINT_MODEL = os.environ.get("SD_INPAINT_MODEL", "stabilityai/stable-diffusion-2-inpainting")
+# stabilityai/* inpainting repos are gated (HTTP 401); default to a public mirror.
+SD_INPAINT_MODEL = os.environ.get("SD_INPAINT_MODEL", "botp/stable-diffusion-v1-5-inpainting")
 
 ProgressCb = Optional[Callable[[float, str], None]]
 
