@@ -1,0 +1,17 @@
+fastapi
+uvicorn[standard]
+python-multipart
+insightface==0.7.3
+onnxruntime-gpu==1.16.3
+rembg[gpu]
+opencv-python-headless
+segment-anything
+Pillow
+numpy
+requests
+deep-translator
+diffusers
+transformers
+accelerate
+xformers
+huggingface_hub
