@@ -8,6 +8,8 @@ audio back in a single pass. Same approach for face swap and color swap.
 """
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 from dataclasses import dataclass
 from typing import Iterator
@@ -15,7 +17,20 @@ from typing import Iterator
 import cv2
 import numpy as np
 
-FFMPEG = "ffmpeg"
+
+def _ffmpeg_bin() -> str:
+    """Pick an ffmpeg with libx264. Conda ships a minimal ffmpeg (no libx264,
+    so -preset/-crf error out); the apt build at /usr/bin has it. Prefer that."""
+    env = os.environ.get("FFMPEG_BIN")
+    if env:
+        return env
+    for cand in ("/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
+        if os.path.exists(cand):
+            return cand
+    return shutil.which("ffmpeg") or "ffmpeg"
+
+
+FFMPEG = _ffmpeg_bin()
 
 
 @dataclass
