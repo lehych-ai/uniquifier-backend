@@ -98,6 +98,7 @@ def get_source_face(analyzer, face_image_path: str):
     if img is None:
         raise ValueError(f"cannot load face image: {face_image_path}")
     faces = detect_faces(analyzer, img)
+    log.info("source photo '%s': detected %d face(s)", face_image_path, len(faces))
     if not faces:
         raise ValueError("no face detected in the source photo")
     return faces[0]
@@ -117,7 +118,10 @@ def _enhance(image: np.ndarray) -> np.ndarray:
 
 def swap_single_image(image, source_face, analyzer, swapper, swap_all=False, enhance=True):
     target_faces = detect_faces(analyzer, image)
+    log.info("target frame %s: detected %d face(s), swap_all=%s, enhance=%s",
+             image.shape[:2], len(target_faces), swap_all, enhance)
     if not target_faces:
+        log.warning("no face in target frame — returning original (no swap)")
         return image, []
     result = image.copy()
     targets = target_faces if swap_all else target_faces[:1]
