@@ -13,7 +13,9 @@ gfpgan==1.3.8
 rembg[gpu]
 opencv-python-headless
 Pillow
-numpy
+# onnxruntime / insightface / basicsr wheels are built against NumPy 1.x — NumPy
+# 2.x breaks their ABI ("_ARRAY_API not found"). Pin below 2.
+numpy<2
 
 # background / clothes generation
 diffusers
