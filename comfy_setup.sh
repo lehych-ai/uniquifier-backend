@@ -20,14 +20,27 @@ echo "==> system packages"
 apt-get update -y
 apt-get install -y --no-install-recommends git wget curl ffmpeg libgl1 libglib2.0-0
 
-echo "==> ComfyUI core"
-if [ -d "$COMFY_DIR/.git" ]; then
-  git -C "$COMFY_DIR" pull --ff-only || true
-else
-  git clone --depth 1 https://github.com/comfyanonymous/ComfyUI "$COMFY_DIR"
-fi
+echo "==> ComfyUI core (pinned to a torch-2.1-compatible era)"
+# The pod's torch is 2.1.0 (required by onnxruntime-gpu/inswapper on CUDA 11.8).
+# Recent ComfyUI needs torch>=2.4 (torch.library.custom_op via comfy_kitchen) and
+# pulls numpy 2.x — both break this image. Pin ComfyUI + every node to a 2024
+# commit that still runs on torch 2.1, and force numpy<2 at the end.
+PIN_DATE="${COMFY_PIN_DATE:-2024-09-15}"
+
+pin_repo() {  # pin_repo <dir>
+  local dir="$1" c
+  git -C "$dir" fetch -q --unshallow 2>/dev/null || git -C "$dir" fetch -q || true
+  c="$(git -C "$dir" rev-list -1 --before="$PIN_DATE 00:00" HEAD 2>/dev/null || true)"
+  if [ -n "$c" ]; then
+    git -C "$dir" checkout -q "$c" && echo "    pinned $(basename "$dir") -> ${c:0:8} (<=$PIN_DATE)"
+  else
+    echo "    !! could not pin $(basename "$dir")"
+  fi
+}
+
+[ -d "$COMFY_DIR/.git" ] || git clone https://github.com/comfyanonymous/ComfyUI "$COMFY_DIR"
+pin_repo "$COMFY_DIR"
 cd "$COMFY_DIR"
-# torch already ships in the pytorch image — install the rest of ComfyUI's deps.
 pip install --upgrade pip
 pip install -r requirements.txt
 
@@ -36,16 +49,12 @@ mkdir -p "$NODES"
 clone_node() {  # clone_node <giturl>
   local url="$1" name
   name="$(basename "$url" .git)"
-  if [ -d "$NODES/$name/.git" ]; then
-    git -C "$NODES/$name" pull --ff-only || true
-  else
-    git clone --depth 1 "$url" "$NODES/$name" || { echo "    !! clone failed: $name"; return; }
-  fi
+  [ -d "$NODES/$name/.git" ] || git clone "$url" "$NODES/$name" || { echo "    !! clone failed: $name"; return; }
+  pin_repo "$NODES/$name"
   [ -f "$NODES/$name/requirements.txt" ] && pip install -r "$NODES/$name/requirements.txt" || true
 }
 
-echo "==> custom nodes"
-clone_node https://github.com/ltdrdata/ComfyUI-Manager                 # node/model manager
+echo "==> custom nodes (pinned)"
 clone_node https://github.com/Kosinkadink/ComfyUI-AnimateDiff-Evolved  # temporal (anti-flicker)
 clone_node https://github.com/Kosinkadink/ComfyUI-Advanced-ControlNet  # AD-compatible controlnet
 clone_node https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite     # load/save video
@@ -116,6 +125,11 @@ if not os.path.isdir(os.path.join(dest, "buffalo_l")):
 else:
     print("    buffalo_l present")
 PY
+
+# ComfyUI/node pip installs may have pulled numpy 2.x — force it back below 2 so
+# torch/insightface/onnxruntime keep their ABI ("_ARRAY_API not found" otherwise).
+echo "==> pinning numpy<2 (shared with the inswapper backend)"
+pip install -q "numpy<2" || true
 
 echo "==> wiring cuDNN onto LD_LIBRARY_PATH (onnxruntime for FaceID)"
 CUDNN_LIB="$(find /opt/conda -name 'libcudnn.so.8*' 2>/dev/null | head -1)"
