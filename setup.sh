@@ -30,8 +30,10 @@ echo "==> code"
 # `pull --ff-only || true` silently FAILED on the shallow clone, so the pod kept
 # running stale code through every redeploy — fetch + hard reset is bulletproof.
 if [ -d "$APP_DIR/.git" ]; then
-  git -C "$APP_DIR" fetch --depth 1 origin main
-  git -C "$APP_DIR" reset --hard origin/main
+  git -C "$APP_DIR" fetch --depth 1 origin main || git -C "$APP_DIR" fetch origin main
+  # reset to FETCH_HEAD (exactly what we just fetched) — the origin/main tracking
+  # ref can be stale on a shallow clone, which left the pod on old code.
+  git -C "$APP_DIR" reset --hard FETCH_HEAD
 else
   git clone --depth 1 "$REPO" "$APP_DIR"
 fi
