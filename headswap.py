@@ -28,12 +28,12 @@ COMFY_INPUT = os.path.join(COMFY_DIR, "input")
 COMFY_OUTPUT = os.path.join(COMFY_DIR, "output")
 
 
-def _post(path: str, body: dict) -> dict:
+def _post(path: str, body: dict, timeout: float = 60) -> dict:
     req = urllib.request.Request(
         COMFY_API + path, data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json"}, method="POST",
     )
-    with urllib.request.urlopen(req, timeout=60) as r:
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode())
 
 
@@ -119,13 +119,33 @@ def run_head_swap(src_video: str, face_image: str, params: dict,
     shutil.copy2(src_video, os.path.join(COMFY_INPUT, vid_name))
     shutil.copy2(face_image, os.path.join(COMFY_INPUT, face_name))
 
+    # ComfyUI runs one prompt at a time and its HTTP server stalls while busy.
+    # Clear any stale queue (e.g. leftovers from a previous attempt) and stop a
+    # running job so ours starts promptly, then submit with retries — the POST
+    # itself can be refused for a while if the server is mid-execution.
+    for ep, bd in (("/interrupt", {}), ("/queue", {"clear": True})):
+        try:
+            _post(ep, bd, timeout=10)
+        except Exception:  # noqa: BLE001
+            pass
+
     graph = build_prompt(vid_name, face_name, params)
-    resp = _post("/prompt", {"prompt": graph})
+    resp = None
+    for attempt in range(5):
+        try:
+            resp = _post("/prompt", {"prompt": graph}, timeout=120)
+            break
+        except Exception as exc:  # noqa: BLE001 — server busy; back off and retry
+            if attempt == 4:
+                raise RuntimeError(f"ComfyUI did not accept the prompt (busy): {exc}")
+            if on_progress:
+                on_progress(0.05, "waiting for ComfyUI queue")
+            time.sleep(12)
     if resp.get("node_errors"):
         raise RuntimeError(f"ComfyUI rejected graph: {json.dumps(resp['node_errors'])[:800]}")
     prompt_id = resp["prompt_id"]
     if on_progress:
-        on_progress(0.05, "queued on ComfyUI")
+        on_progress(0.1, "queued on ComfyUI")
 
     # poll history until this prompt produces an output (or errors). ComfyUI's
     # HTTP server can lag for tens of seconds while it cold-loads models or pulls
