@@ -11,6 +11,13 @@ PORT="${PORT:-8000}"
 REPO="${REPO:-https://github.com/lehych-ai/uniquifier-backend}"
 
 echo "==> system packages"
+# Fail fast on a stalled apt mirror (some Vast hosts have a dog-slow link to
+# archive.ubuntu.com) and retry, instead of hanging for 10+ minutes.
+cat > /etc/apt/apt.conf.d/99closerai <<'APT'
+Acquire::Retries "3";
+Acquire::http::Timeout "20";
+Acquire::https::Timeout "20";
+APT
 apt-get update -y
 # build-essential is required: insightface compiles a Cython extension from
 # source, and the pytorch *-runtime images ship without a compiler (no g++).
