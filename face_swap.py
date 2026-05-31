@@ -104,16 +104,43 @@ def get_source_face(analyzer, face_image_path: str):
     return faces[0]
 
 
-def _enhance(image: np.ndarray) -> np.ndarray:
+def _enhance_face_region(frame: np.ndarray, box) -> np.ndarray:
+    """Run GFPGAN on just the swapped face crop and feather it back in.
+
+    Why not the whole frame: the old code enhanced the entire image every frame
+    (only_center_face=False). That's the slowest step in the pipeline, it also
+    "restores" the background and any bystanders, and can over-smooth. inswapper
+    already gives us the box, so we crop a padded region, restore only that face,
+    and blend it back — ~2x faster and it never touches the background.
+    """
     enhancer = get_enhancer()
     if enhancer is None:
-        return image
+        return frame
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = [int(v) for v in box]
+    # pad ~35% so GFPGAN has context to detect + align the face
+    pw, ph = int((x2 - x1) * 0.35), int((y2 - y1) * 0.35)
+    cx1, cy1 = max(0, x1 - pw), max(0, y1 - ph)
+    cx2, cy2 = min(w, x2 + pw), min(h, y2 + ph)
+    if cx2 <= cx1 or cy2 <= cy1:
+        return frame
+    crop = frame[cy1:cy2, cx1:cx2]
     try:
-        _, _, restored = enhancer.enhance(image, has_aligned=False, only_center_face=False, paste_back=True)
-        return restored if restored is not None else image
+        _, _, restored = enhancer.enhance(crop, has_aligned=False, only_center_face=True, paste_back=True)
     except Exception as exc:  # noqa: BLE001
         log.debug("enhance failed: %s", exc)
-        return image
+        return frame
+    if restored is None:
+        return frame
+    if restored.shape[:2] != crop.shape[:2]:
+        restored = cv2.resize(restored, (crop.shape[1], crop.shape[0]))
+    # feathered elliptical blend so the patch melts into the original frame
+    mask = np.zeros(crop.shape[:2], np.float32)
+    cv2.ellipse(mask, ((cx2 - cx1) // 2, (cy2 - cy1) // 2),
+                ((cx2 - cx1) // 2, (cy2 - cy1) // 2), 0, 0, 360, 1.0, -1)
+    mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=max(2, (cx2 - cx1) // 12))[..., None]
+    frame[cy1:cy2, cx1:cx2] = (restored * mask + crop * (1 - mask)).astype(np.uint8)
+    return frame
 
 
 def swap_single_image(image, source_face, analyzer, swapper, swap_all=False, enhance=True):
@@ -127,9 +154,10 @@ def swap_single_image(image, source_face, analyzer, swapper, swap_all=False, enh
     targets = target_faces if swap_all else target_faces[:1]
     for face in targets:
         result = swapper.get(result, face, source_face, paste_back=True)
-    if enhance:
-        result = _enhance(result)
     boxes = [f.bbox.astype(int) for f in targets]
+    if enhance:
+        for bx in boxes:
+            result = _enhance_face_region(result, bx)
     return result, boxes
 
 

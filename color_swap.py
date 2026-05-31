@@ -85,6 +85,16 @@ def _get_inpaint_pipe():
             SD_INPAINT_MODEL, torch_dtype=torch.float16
         ).to("cuda")
         _inpaint_pipe.safety_checker = None
+        # Memory-efficient attention without the xformers dependency. Prefer
+        # xformers if it happens to be present; otherwise fall back to PyTorch's
+        # built-in sliced attention. Both are no-ops on failure.
+        try:
+            _inpaint_pipe.enable_xformers_memory_efficient_attention()
+        except Exception:  # noqa: BLE001
+            try:
+                _inpaint_pipe.enable_attention_slicing()
+            except Exception:  # noqa: BLE001
+                pass
         log.info("SD inpainting loaded (%s)", SD_INPAINT_MODEL)
     return _inpaint_pipe
 

@@ -21,8 +21,10 @@ numpy<2
 diffusers
 transformers
 accelerate
-xformers
 huggingface_hub
+# xformers intentionally omitted: its wheels pin an exact torch build and a
+# mismatch makes diffusers fail to import. We enable memory-efficient/sliced
+# attention at runtime instead (see color_swap._get_inpaint_pipe).
 
 # prompt translation
 deep-translator

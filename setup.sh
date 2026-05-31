@@ -50,6 +50,18 @@ dl "https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_12
 dl "https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth" \
    "$MODELS_DIR/GFPGANv1.4.pth"
 
+# Pre-fetch the InsightFace detector pack (buffalo_l ~280MB). Without this the
+# first face-swap request stalls while it downloads mid-request.
+echo "==> prefetch insightface buffalo_l"
+python - <<'PY'
+try:
+    from insightface.app import FaceAnalysis
+    FaceAnalysis(name="buffalo_l")  # construction downloads the model pack
+    print("    buffalo_l cached")
+except Exception as e:
+    print("    buffalo_l prefetch skipped (will lazy-load):", e)
+PY
+
 # Warm rembg model cache (person matte + clothes segmentation)
 echo "==> warming rembg models"
 python - <<'PY'
