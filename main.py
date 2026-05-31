@@ -427,8 +427,11 @@ def admin_redeploy(_=Depends(require_token)):
     """Pull the latest backend code and restart uvicorn (detached, survives our exit).
     Lets me ship new endpoints without a terminal — the running process can't
     hot-reload, so we relaunch it via setup.sh."""
+    # NB: the '[u]vicorn' bracket trick stops pkill from matching THIS very command
+    # line (which contains the pattern as a literal) and killing itself before it
+    # can relaunch — otherwise the backend never comes back up.
     script = (
-        "sleep 1; pkill -f 'uvicorn main:app' 2>/dev/null; "
+        "sleep 1; pkill -f '[u]vicorn' 2>/dev/null; sleep 1; "
         "wget -qO /root/setup.sh https://raw.githubusercontent.com/lehych-ai/uniquifier-backend/main/setup.sh; "
         "nohup bash /root/setup.sh > /root/setup.log 2>&1 &"
     )
