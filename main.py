@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import threading
 import urllib.error
@@ -241,6 +242,42 @@ def face_swap_video_route(
 
     threading.Thread(target=work, daemon=True).start()
     return {"job_id": job_id, "video_id": video_id, "status": "started"}
+
+
+# ─────────────────────────────────────────
+# full head + hair swap (ComfyUI / AnimateDiff)
+# ─────────────────────────────────────────
+
+@app.post("/api/head-swap-video")
+async def head_swap_video_route(req: Request, _=Depends(require_token)):
+    import headswap
+
+    body = await req.json()
+    video_id = body.get("video_id", "")
+    params = body.get("params", {}) or {}
+    src = _up(video_id, "src.mp4")
+    face = _up(video_id, "face.jpg")
+    if not os.path.isfile(src):
+        raise HTTPException(400, "no source video for this id (upload via /api/extract-frame)")
+    if not os.path.isfile(face):
+        raise HTTPException(400, "no face for this id (upload via /api/face-swap-preview)")
+    out_final = os.path.join(OUTPUT_DIR, f"{video_id}_head.mp4")
+
+    def work():
+        _set_progress(video_id, 0.0, "running")
+        try:
+            out = headswap.run_head_swap(
+                src, face, params,
+                on_progress=lambda p, m: _set_progress(video_id, p, "running"),
+            )
+            shutil.copy2(out, out_final)
+            PROGRESS[video_id] = {"percent": 1.0, "status": "done",
+                                  "output_url": f"/files/outputs/{video_id}_head.mp4", "error": None}
+        except Exception as exc:  # noqa: BLE001
+            PROGRESS[video_id] = {"percent": 0.0, "status": "failed", "output_url": None, "error": str(exc)}
+
+    threading.Thread(target=work, daemon=True).start()
+    return {"video_id": video_id, "status": "started"}
 
 
 # ─────────────────────────────────────────
