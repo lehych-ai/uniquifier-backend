@@ -19,12 +19,15 @@ leave it unset for open access (e.g. behind a private Vast proxy).
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import threading
+import urllib.error
+import urllib.request
 import uuid
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
@@ -324,3 +327,73 @@ def comfy_diag(_=Depends(require_token)):
             "insightface": ls(os.path.join(m, "insightface", "models")),
         },
     }
+
+
+# ---- proxy to the local ComfyUI server (8188, not publicly exposed) ----
+
+COMFY_API = "http://127.0.0.1:8188"
+
+
+def _comfy_req(path: str, data: bytes | None = None, timeout: float = 30):
+    req = urllib.request.Request(
+        COMFY_API + path, data=data,
+        headers={"Content-Type": "application/json"} if data else {},
+        method="POST" if data else "GET",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+@app.get("/api/comfy/nodes")
+def comfy_nodes(_=Depends(require_token)):
+    """List installed node class_types — used to author the workflow with exact names."""
+    try:
+        info = json.loads(_comfy_req("/object_info"))
+        return {"count": len(info), "nodes": sorted(info.keys())}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(503, f"ComfyUI not reachable: {exc}")
+
+
+@app.get("/api/comfy/node/{name}")
+def comfy_node(name: str, _=Depends(require_token)):
+    """Full input schema for one node (so the workflow wires inputs correctly)."""
+    try:
+        return json.loads(_comfy_req("/object_info/" + name))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(503, f"ComfyUI not reachable: {exc}")
+
+
+@app.post("/api/comfy/prompt")
+async def comfy_prompt(req: Request, _=Depends(require_token)):
+    """Forward a workflow ({"prompt": {...}}) to ComfyUI; returns {prompt_id}."""
+    body = await req.body()
+    try:
+        return json.loads(_comfy_req("/prompt", data=body, timeout=60))
+    except urllib.error.HTTPError as exc:
+        raise HTTPException(400, exc.read().decode(errors="replace"))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(503, f"ComfyUI not reachable: {exc}")
+
+
+@app.get("/api/comfy/result/{prompt_id}")
+def comfy_result(prompt_id: str, _=Depends(require_token)):
+    """Poll a submitted prompt: returns its /history entry (outputs when done)."""
+    try:
+        hist = json.loads(_comfy_req("/history/" + prompt_id))
+        return hist.get(prompt_id, {"status": "pending"})
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(503, f"ComfyUI not reachable: {exc}")
+
+
+@app.post("/api/admin/redeploy")
+def admin_redeploy(_=Depends(require_token)):
+    """Pull the latest backend code and restart uvicorn (detached, survives our exit).
+    Lets me ship new endpoints without a terminal — the running process can't
+    hot-reload, so we relaunch it via setup.sh."""
+    script = (
+        "sleep 1; pkill -f 'uvicorn main:app' 2>/dev/null; "
+        "wget -qO /root/setup.sh https://raw.githubusercontent.com/lehych-ai/uniquifier-backend/main/setup.sh; "
+        "nohup bash /root/setup.sh > /root/setup.log 2>&1 &"
+    )
+    subprocess.Popen(["bash", "-c", script], start_new_session=True)
+    return {"restarting": True}
