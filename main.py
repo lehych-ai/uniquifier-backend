@@ -99,12 +99,15 @@ def serve_file(kind: str, name: str):
 # ─────────────────────────────────────────
 
 @app.post("/api/extract-frame")
-async def extract_frame(video: UploadFile = File(...), _=Depends(require_token)):
+def extract_frame(video: UploadFile = File(...), _=Depends(require_token)):
+    # NB: sync `def` route — FastAPI runs it in a threadpool, so the heavy ffmpeg
+    # call never blocks uvicorn's event loop (an async route doing blocking work
+    # freezes the whole server). Use the sync .file handle, not await .read().
     video_id = uuid.uuid4().hex[:16]
     video_path = _up(video_id, "src.mp4")
     frame_path = _up(video_id, "frame0.jpg")
     with open(video_path, "wb") as f:
-        f.write(await video.read())
+        shutil.copyfileobj(video.file, f)
     subprocess.run(
         ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
          "-i", video_path, "-frames:v", "1", "-q:v", "2", frame_path],
@@ -194,19 +197,32 @@ def color_swap_video_route(video_id: str = Form(...), _=Depends(require_token)):
 # face swap
 # ─────────────────────────────────────────
 
+@app.post("/api/upload-face")
+def upload_face(video_id: str = Form(...), face: UploadFile = File(...), _=Depends(require_token)):
+    """Store the reference face only — no inference. Used by head-swap (and any
+    flow that just needs the face on disk) so it doesn't pay the inswapper cold
+    load just to upload a file."""
+    face_path = _up(video_id, "face.jpg")
+    with open(face_path, "wb") as f:
+        shutil.copyfileobj(face.file, f)
+    return {"video_id": video_id, "stored": True}
+
+
 @app.post("/api/face-swap-preview")
-async def face_swap_preview_route(
+def face_swap_preview_route(
     video_id: str = Form(...),
     swap_all: bool = Form(False),
     enhance: bool = Form(True),
     face: UploadFile = File(...),
     _=Depends(require_token),
 ):
+    # sync `def` so the blocking inswapper run executes in a threadpool, not on
+    # the event loop (that hang froze the whole server).
     from face_swap import face_swap_preview
 
     face_path = _up(video_id, "face.jpg")
     with open(face_path, "wb") as f:
-        f.write(await face.read())
+        shutil.copyfileobj(face.file, f)
     out = _up(video_id, "face_preview.jpg")
     face_swap_preview(_up(video_id, "frame0.jpg"), face_path, out, swap_all=swap_all, enhance=enhance)
     return FileResponse(out, media_type="image/jpeg")
