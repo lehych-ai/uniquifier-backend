@@ -37,8 +37,8 @@ def _post(path: str, body: dict) -> dict:
         return json.loads(r.read().decode())
 
 
-def _get(path: str) -> dict:
-    with urllib.request.urlopen(COMFY_API + path, timeout=30) as r:
+def _get(path: str, timeout: float = 60) -> dict:
+    with urllib.request.urlopen(COMFY_API + path, timeout=timeout) as r:
         return json.loads(r.read().decode())
 
 
@@ -127,15 +127,22 @@ def run_head_swap(src_video: str, face_image: str, params: dict,
     if on_progress:
         on_progress(0.05, "queued on ComfyUI")
 
-    # poll history until this prompt produces an output (or errors)
-    deadline = time.time() + 1800
+    # poll history until this prompt produces an output (or errors). ComfyUI's
+    # HTTP server can lag for tens of seconds while it cold-loads models or pulls
+    # a preprocessor weight on first run — a single timed-out poll must NOT fail
+    # the whole job, so we swallow transient errors and keep polling.
+    deadline = time.time() + 2400
     while time.time() < deadline:
-        time.sleep(3)
-        hist = _get("/history/" + prompt_id).get(prompt_id)
-        if not hist:
-            # check the queue / running prompt for a coarse progress signal
+        time.sleep(4)
+        try:
+            hist = _get("/history/" + prompt_id, timeout=90).get(prompt_id)
+        except Exception:  # noqa: BLE001 — transient (server busy loading); retry
             if on_progress:
-                on_progress(0.2, "rendering")
+                on_progress(0.2, "loading models / rendering")
+            continue
+        if not hist:
+            if on_progress:
+                on_progress(0.25, "rendering")
             continue
         status = hist.get("status", {})
         if status.get("status_str") == "error" or status.get("completed") is False and status.get("messages"):
