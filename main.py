@@ -67,6 +67,18 @@ def _set_progress(video_id: str, percent: float, status: str, **extra) -> None:
 # status / files
 # ─────────────────────────────────────────
 
+@app.get("/api/version")
+def version():
+    """Short git HEAD of the code the backend is actually running — confirms a
+    redeploy really took (the old shallow `git pull` used to silently no-op)."""
+    try:
+        h = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                            capture_output=True, text=True, cwd=os.path.dirname(__file__) or ".").stdout.strip()
+    except Exception:  # noqa: BLE001
+        h = "unknown"
+    return {"head": h}
+
+
 @app.get("/api/status")
 def status():
     import face_swap

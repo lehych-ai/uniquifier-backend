@@ -26,12 +26,17 @@ apt-get install -y --no-install-recommends \
   ffmpeg git wget curl libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev
 
 echo "==> code"
+# Force the working tree to exactly match the latest remote main. The old
+# `pull --ff-only || true` silently FAILED on the shallow clone, so the pod kept
+# running stale code through every redeploy — fetch + hard reset is bulletproof.
 if [ -d "$APP_DIR/.git" ]; then
-  git -C "$APP_DIR" pull --ff-only || true
+  git -C "$APP_DIR" fetch --depth 1 origin main
+  git -C "$APP_DIR" reset --hard origin/main
 else
   git clone --depth 1 "$REPO" "$APP_DIR"
 fi
 cd "$APP_DIR"
+git rev-parse --short HEAD | sed 's/^/    code @ /'
 # If this script lives in a gpu-backend/ subdir of the desktop repo, use that.
 [ -f "$APP_DIR/gpu-backend/main.py" ] && cd "$APP_DIR/gpu-backend"
 
