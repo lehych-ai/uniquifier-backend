@@ -247,3 +247,80 @@ def face_swap_video_route(
 @app.get("/api/progress/{video_id}")
 def progress(video_id: str, _=Depends(require_token)):
     return PROGRESS.get(video_id, {"percent": 0.0, "status": "unknown", "output_url": None, "error": None})
+
+
+# ─────────────────────────────────────────
+# ComfyUI control plane (drive the head-swap engine over HTTP, no terminal/SSH)
+#
+# Narrow surface — NOT arbitrary exec: install runs a fixed script, log tails a
+# fixed file, diag lists fixed dirs. All gated behind the API token.
+# ─────────────────────────────────────────
+
+COMFY_DIR = os.environ.get("COMFY_DIR", "/root/ComfyUI")
+COMFY_LOG = "/root/comfy.log"
+COMFY_SETUP = "/root/comfy_setup.sh"
+COMFY_SETUP_URL = "https://raw.githubusercontent.com/lehych-ai/uniquifier-backend/main/comfy_setup.sh"
+
+
+def _comfy_running() -> bool:
+    return subprocess.run(["pgrep", "-f", "comfy_setup.sh"], capture_output=True).returncode == 0
+
+
+def _port_open(port: int) -> bool:
+    import socket
+    s = socket.socket()
+    s.settimeout(1.0)
+    try:
+        s.connect(("127.0.0.1", port))
+        return True
+    except Exception:
+        return False
+    finally:
+        s.close()
+
+
+@app.post("/api/comfy/install")
+def comfy_install(_=Depends(require_token)):
+    """Pull the latest comfy_setup.sh and run it in the background (idempotent)."""
+    if _comfy_running():
+        return {"started": False, "reason": "comfy_setup already running"}
+    subprocess.run(["wget", "-qO", COMFY_SETUP, COMFY_SETUP_URL], check=False)
+    logf = open(COMFY_LOG, "w")
+    subprocess.Popen(["bash", COMFY_SETUP], stdout=logf, stderr=subprocess.STDOUT,
+                     start_new_session=True)
+    return {"started": True}
+
+
+@app.get("/api/comfy/log")
+def comfy_log(lines: int = 120, _=Depends(require_token)):
+    try:
+        with open(COMFY_LOG, errors="replace") as f:
+            tail = f.readlines()[-lines:]
+        return {"log": "".join(tail), "installing": _comfy_running()}
+    except FileNotFoundError:
+        return {"log": "", "installing": _comfy_running()}
+
+
+@app.get("/api/comfy/diag")
+def comfy_diag(_=Depends(require_token)):
+    def ls(p: str) -> list[str]:
+        try:
+            return sorted(os.listdir(p))
+        except Exception:
+            return []
+    m = os.path.join(COMFY_DIR, "models")
+    return {
+        "comfy_up": _port_open(8188),
+        "installing": _comfy_running(),
+        "nodes": ls(os.path.join(COMFY_DIR, "custom_nodes")),
+        "models": {
+            "checkpoints": ls(os.path.join(m, "checkpoints")),
+            "vae": ls(os.path.join(m, "vae")),
+            "animatediff_models": ls(os.path.join(m, "animatediff_models")),
+            "controlnet": ls(os.path.join(m, "controlnet")),
+            "ipadapter": ls(os.path.join(m, "ipadapter")),
+            "clip_vision": ls(os.path.join(m, "clip_vision")),
+            "loras": ls(os.path.join(m, "loras")),
+            "insightface": ls(os.path.join(m, "insightface", "models")),
+        },
+    }
