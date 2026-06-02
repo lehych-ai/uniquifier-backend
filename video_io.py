@@ -18,19 +18,38 @@ import cv2
 import numpy as np
 
 
-def _ffmpeg_bin() -> str:
-    """Pick an ffmpeg with libx264. Conda ships a minimal ffmpeg (no libx264,
-    so -preset/-crf error out); the apt build at /usr/bin has it. Prefer that."""
+def _encoders(bin_path: str) -> str:
+    try:
+        return subprocess.run([bin_path, "-hide_banner", "-encoders"],
+                              capture_output=True, text=True, timeout=20).stdout
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _pick_ffmpeg() -> tuple[str, str]:
+    """Return (ffmpeg_bin, h264_encoder). Conda ships a minimal ffmpeg without
+    libx264 (so -c:v libx264 makes ffmpeg exit immediately → BrokenPipe on the
+    first frame write). Prefer an ffmpeg that actually has an H.264 encoder; fall
+    back across candidates and encoder names so we never pipe into a dead ffmpeg."""
     env = os.environ.get("FFMPEG_BIN")
-    if env:
-        return env
-    for cand in ("/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
-        if os.path.exists(cand):
-            return cand
-    return shutil.which("ffmpeg") or "ffmpeg"
+    cands = [env] if env else []
+    cands += ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", shutil.which("ffmpeg") or "ffmpeg"]
+    seen, ordered = set(), []
+    for c in cands:
+        if c and c not in seen and (os.path.exists(c) or c == "ffmpeg"):
+            seen.add(c)
+            ordered.append(c)
+    # first binary that has a usable H.264 encoder
+    for b in ordered:
+        enc = _encoders(b)
+        for name in ("libx264", "libopenh264", "h264_nvenc"):
+            if f" {name} " in enc or f" {name}\n" in enc:
+                return b, name
+    # nothing with H.264 — last resort: first binary + mpeg4 (always present)
+    return (ordered[0] if ordered else "ffmpeg"), "mpeg4"
 
 
-FFMPEG = _ffmpeg_bin()
+FFMPEG, H264_ENC = _pick_ffmpeg()
 
 
 @dataclass
@@ -96,25 +115,47 @@ class FfmpegWriter:
             cmd += ["-map", "1:a:0?", "-c:a", "aac", "-b:a", "128k", "-shortest"]
         else:
             cmd += ["-an"]
-        cmd += [
-            "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-            out_path,
-        ]
-        self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+        cmd += ["-c:v", H264_ENC]
+        # libx264 / libopenh264 take -crf/-preset; mpeg4 uses -q:v instead.
+        if H264_ENC in ("libx264", "libopenh264"):
+            cmd += ["-preset", preset, "-crf", str(crf)]
+        elif H264_ENC == "h264_nvenc":
+            cmd += ["-preset", "p5", "-cq", str(crf)]
+        else:  # mpeg4
+            cmd += ["-q:v", "3"]
+        cmd += ["-pix_fmt", "yuv420p", "-movflags", "+faststart", out_path]
+        self._cmd = cmd
+        # capture stderr so a dead ffmpeg surfaces its reason instead of an opaque
+        # BrokenPipe; loglevel=error keeps it tiny so the PIPE never deadlocks.
+        self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def _ffmpeg_err(self) -> str:
+        try:
+            err = self._proc.stderr.read().decode(errors="replace") if self._proc.stderr else ""
+        except Exception:  # noqa: BLE001
+            err = ""
+        return err.strip()[-600:]
 
     def write(self, frame: np.ndarray) -> None:
         if frame.shape[1] != self.meta.width or frame.shape[0] != self.meta.height:
             frame = cv2.resize(frame, (self.meta.width, self.meta.height))
         assert self._proc.stdin is not None
-        self._proc.stdin.write(np.ascontiguousarray(frame, dtype=np.uint8).tobytes())
+        try:
+            self._proc.stdin.write(np.ascontiguousarray(frame, dtype=np.uint8).tobytes())
+        except BrokenPipeError:
+            raise RuntimeError(
+                f"ffmpeg died (enc={H264_ENC}, bin={FFMPEG}): {self._ffmpeg_err()}"
+            ) from None
 
     def close(self) -> None:
         if self._proc.stdin:
-            self._proc.stdin.close()
+            try:
+                self._proc.stdin.close()
+            except BrokenPipeError:
+                pass
         rc = self._proc.wait()
         if rc != 0:
-            raise RuntimeError(f"ffmpeg encoder exited {rc} for {self.out_path}")
+            raise RuntimeError(f"ffmpeg encoder exited {rc} (enc={H264_ENC}): {self._ffmpeg_err()}")
 
     def __enter__(self) -> "FfmpegWriter":
         return self

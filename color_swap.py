@@ -170,18 +170,23 @@ def clothes_mask(frame_bgr: np.ndarray, region: str = "upper") -> np.ndarray:
     Always subtract skin so the face/arms are protected."""
     h, w = frame_bgr.shape[:2]
     band = _region_band(h, w, region)
+    person = person_mask(frame_bgr)
     base = None
     sess = _get_cloth_session()
     if sess is not None:
         alpha = _rembg_alpha(sess, frame_bgr)
-        # cloth-seg isolates garments, but can spill onto sleeves/periphery — keep
-        # it on the body by intersecting with the torso band.
-        if int((alpha > 30).sum()) > 0.01 * h * w:
-            base = cv2.bitwise_and(alpha, band)
+        # use the FULL garment mask (cloth-seg is garment-only) when coverage is
+        # plausible — clipping it to a band turned a whole sweater into a stripe.
+        area = int((alpha > 30).sum())
+        if 0.01 * h * w < area < 0.75 * h * w:
+            base = alpha
     if base is None:
         # fallback: person silhouette ∩ torso band
-        base = cv2.bitwise_and(person_mask(frame_bgr), band)
-    # never recolor skin (face/neck/arms)
+        base = cv2.bitwise_and(person, band)
+    # the garment must lie ON the person — this kills background leak (e.g. a sofa
+    # behind her at torso height) far better than a full-width band ever could.
+    base = cv2.bitwise_and(base, person)
+    # never touch skin (face/neck/arms)
     base = cv2.bitwise_and(base, cv2.bitwise_not(_skin_mask(frame_bgr)))
     # close small holes so the garment reads as one solid region
     base = cv2.morphologyEx(base, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
