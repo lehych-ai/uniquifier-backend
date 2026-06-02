@@ -218,7 +218,11 @@ def clothes_mask(frame_bgr: np.ndarray, region: str = "upper") -> np.ndarray:
     # 1) best path: SegFormer human parsing — already excludes hair/skin/bg.
     seg = _segformer_clothes_mask(frame_bgr, region)
     if seg is not None and int((seg > 0).sum()) > 0.003 * h * w:
-        return cv2.morphologyEx(seg, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+        seg = cv2.morphologyEx(seg, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+        # pull the edge in a touch so the feathered recolor/inpaint can't bleed
+        # past the garment onto adjacent skin (e.g. a bare shoulder/tattoo).
+        seg = cv2.erode(seg, np.ones((5, 5), np.uint8), iterations=1)
+        return seg
     return _clothes_mask_fallback(frame_bgr, region)
 
 
