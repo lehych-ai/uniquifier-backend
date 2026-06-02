@@ -126,13 +126,18 @@ def translate_prompt(text: str) -> str:
 
 def _rembg_alpha(session, frame_bgr: np.ndarray) -> np.ndarray:
     from rembg import remove
+    h, w = frame_bgr.shape[:2]
     pil = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-    out = remove(pil, session=session)
+    # only_mask=True returns a single-channel mask directly. The cloth-seg model
+    # also emits masks at its own resolution, so always resize back to the frame
+    # — otherwise cv2.bitwise_and(alpha, band) fails on a size mismatch.
+    out = remove(pil, session=session, only_mask=True)
     arr = np.array(out)
-    if arr.ndim == 3 and arr.shape[2] == 4:
-        return arr[:, :, 3]
-    gray = cv2.cvtColor(arr[:, :, :3], cv2.COLOR_RGB2GRAY)
-    return gray
+    if arr.ndim == 3:
+        arr = arr[:, :, 3] if arr.shape[2] == 4 else cv2.cvtColor(arr[:, :, :3], cv2.COLOR_RGB2GRAY)
+    if arr.shape[:2] != (h, w):
+        arr = cv2.resize(arr, (w, h), interpolation=cv2.INTER_LINEAR)
+    return arr.astype(np.uint8)
 
 
 def person_mask(frame_bgr: np.ndarray) -> np.ndarray:
