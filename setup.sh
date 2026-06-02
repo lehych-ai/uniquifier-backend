@@ -23,7 +23,25 @@ apt-get update -y
 # source, and the pytorch *-runtime images ship without a compiler (no g++).
 apt-get install -y --no-install-recommends \
   build-essential python3-dev \
-  ffmpeg git wget curl libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev
+  ffmpeg git wget curl xz-utils libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev
+
+# The image's /usr/bin/ffmpeg is a minimal build with libopenh264 but NO libx264
+# (libopenh264 rejects -preset/-crf and looks worse). Drop in a static ffmpeg
+# that has libx264 so the encoder is top-quality and consistent across hosts.
+echo "==> static ffmpeg (libx264)"
+if ! /usr/local/bin/ffmpeg -hide_banner -encoders 2>/dev/null | grep -q ' libx264 '; then
+  TMPF=/tmp/ffmpeg-static.tar.xz
+  if wget -q -O "$TMPF" https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz; then
+    mkdir -p /tmp/ffx && tar -xf "$TMPF" -C /tmp/ffx --strip-components=1 \
+      && cp -f /tmp/ffx/ffmpeg /tmp/ffx/ffprobe /usr/local/bin/ \
+      && chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe \
+      && echo "    static ffmpeg installed" || echo "    static ffmpeg extract failed (will use system ffmpeg)"
+  else
+    echo "    static ffmpeg download failed (will use system ffmpeg)"
+  fi
+else
+  echo "    static ffmpeg already present"
+fi
 
 echo "==> code"
 # Force the working tree to exactly match the latest remote main. The old

@@ -39,10 +39,13 @@ def _pick_ffmpeg() -> tuple[str, str]:
         if c and c not in seen and (os.path.exists(c) or c == "ffmpeg"):
             seen.add(c)
             ordered.append(c)
-    # first binary that has a usable H.264 encoder
-    for b in ordered:
-        enc = _encoders(b)
-        for name in ("libx264", "libopenh264", "h264_nvenc"):
+    # Prefer the best encoder ACROSS binaries: a binary with libx264 beats one
+    # that only has libopenh264, even if the latter is earlier on the path. (The
+    # image's /usr/bin/ffmpeg has libopenh264 only; the static build we drop into
+    # /usr/local/bin has libx264.)
+    bins_enc = [(b, _encoders(b)) for b in ordered]
+    for name in ("libx264", "h264_nvenc", "libopenh264"):
+        for b, enc in bins_enc:
             if f" {name} " in enc or f" {name}\n" in enc:
                 return b, name
     # nothing with H.264 — last resort: first binary + mpeg4 (always present)
@@ -116,11 +119,14 @@ class FfmpegWriter:
         else:
             cmd += ["-an"]
         cmd += ["-c:v", H264_ENC]
-        # libx264 / libopenh264 take -crf/-preset; mpeg4 uses -q:v instead.
-        if H264_ENC in ("libx264", "libopenh264"):
+        # each encoder takes different rate-control flags:
+        if H264_ENC == "libx264":
             cmd += ["-preset", preset, "-crf", str(crf)]
         elif H264_ENC == "h264_nvenc":
-            cmd += ["-preset", "p5", "-cq", str(crf)]
+            cmd += ["-preset", "p5", "-rc", "vbr", "-cq", str(crf)]
+        elif H264_ENC == "libopenh264":
+            # libopenh264 has no -preset/-crf; drive it by bitrate.
+            cmd += ["-b:v", "6M"]
         else:  # mpeg4
             cmd += ["-q:v", "3"]
         cmd += ["-pix_fmt", "yuv420p", "-movflags", "+faststart", out_path]
