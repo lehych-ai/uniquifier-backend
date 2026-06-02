@@ -463,8 +463,11 @@ def color_swap_video(video_path, output_path, plan_path, on_progress: ProgressCb
                 m = clothes_mask(frame, region)
                 if use_inpaint:
                     gen = _sd_inpaint(frame, m, cloth_prompt, seed=cloth_seed, steps=18)
+                    # light temporal smoothing only — a heavy blend ghosts the
+                    # garment edge while the body moves. Fixed seed already keeps
+                    # the garment *type* stable, so we just take the edge off flicker.
                     if prev_gen is not None and prev_gen.shape == gen.shape:
-                        gen = (0.5 * gen.astype(np.float32) + 0.5 * prev_gen.astype(np.float32)).astype(np.uint8)
+                        gen = (0.75 * gen.astype(np.float32) + 0.25 * prev_gen.astype(np.float32)).astype(np.uint8)
                     prev_gen = gen
                     a = _feather(m, k=6)[..., None]
                     out = (gen.astype(np.float32) * a + frame.astype(np.float32) * (1 - a)).astype(np.uint8)
