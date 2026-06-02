@@ -95,9 +95,12 @@ def build_prompt(video_name: str, face_name: str, p: dict) -> dict:
                           "latent_image": ["13", 0], "seed": seed, "steps": steps, "cfg": cfg,
                           "sampler_name": "euler", "scheduler": "normal", "denoise": denoise}},
         "15": {"class_type": "VAEDecode", "inputs": {"samples": ["14", 0], "vae": ["2", 0]}},
+        # the h264-mp4 format carries extra widgets (pix_fmt/crf/save_metadata) that
+        # VHS asserts are present in the inputs — pass them or it AssertionErrors.
         "16": {"class_type": "VHS_VideoCombine",
                "inputs": {"images": ["15", 0], "frame_rate": fps, "loop_count": 0,
                           "filename_prefix": "headswap", "format": "video/h264-mp4",
+                          "pix_fmt": "yuv420p", "crf": 19, "save_metadata": True,
                           "pingpong": False, "save_output": True, "audio": ["3", 2]}},
     }
 
