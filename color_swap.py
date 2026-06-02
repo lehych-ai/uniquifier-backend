@@ -52,6 +52,16 @@ _person_session = None
 _cloth_session = None
 _inpaint_pipe = None
 _translator_ok = True
+_clothes_seg = None  # (model, processor) | False
+
+# mattmdjaga/segformer_b2_clothes class ids → which count as "the garment" per region.
+#  0 bg 1 hat 2 hair 3 sunglasses 4 upper-clothes 5 skirt 6 pants 7 dress 8 belt
+#  9/10 shoes 11 face 12/13 legs 14/15 arms 16 bag 17 scarf
+CLOTHES_CLASSES = {
+    "upper": {4, 7, 17},          # upper-clothes, dress, scarf
+    "lower": {5, 6, 7},           # skirt, pants, dress
+    "full": {1, 4, 5, 6, 7, 17},  # hat + upper + skirt + pants + dress + scarf
+}
 
 
 def _get_person_session():
@@ -165,9 +175,55 @@ def _skin_mask(frame_bgr: np.ndarray) -> np.ndarray:
     return cv2.dilate(skin, np.ones((5, 5), np.uint8), iterations=2)
 
 
+def _get_clothes_segformer():
+    """Human-parsing SegFormer — clean per-class garment masks (upper/dress/pants/
+    skirt), with hair/skin/face/background as their own classes. Falls to False."""
+    global _clothes_seg
+    if _clothes_seg is None:
+        try:
+            import torch
+            from transformers import SegformerForSemanticSegmentation, SegformerImageProcessor
+            mid = os.environ.get("CLOTHES_SEG_MODEL", "mattmdjaga/segformer_b2_clothes")
+            proc = SegformerImageProcessor.from_pretrained(mid)
+            model = SegformerForSemanticSegmentation.from_pretrained(mid).to("cuda").eval()
+            _clothes_seg = (model, proc)
+            log.info("clothes SegFormer loaded (%s)", mid)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("clothes SegFormer unavailable (%s); using rembg fallback", exc)
+            _clothes_seg = False
+    return _clothes_seg or None
+
+
+def _segformer_clothes_mask(frame_bgr: np.ndarray, region: str) -> np.ndarray | None:
+    seg = _get_clothes_segformer()
+    if seg is None:
+        return None
+    import torch
+    model, proc = seg
+    h, w = frame_bgr.shape[:2]
+    rgb = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+    inputs = proc(images=rgb, return_tensors="pt").to("cuda")
+    with torch.no_grad():
+        logits = model(**inputs).logits  # (1, C, h', w')
+    up = torch.nn.functional.interpolate(logits.float(), size=(h, w), mode="bilinear", align_corners=False)
+    pred = up.argmax(dim=1)[0].cpu().numpy().astype(np.uint8)
+    classes = CLOTHES_CLASSES.get(region, CLOTHES_CLASSES["upper"])
+    return (np.isin(pred, list(classes)).astype(np.uint8) * 255)
+
+
 def clothes_mask(frame_bgr: np.ndarray, region: str = "upper") -> np.ndarray:
-    """Per-frame garment mask. Prefer cloth-seg (garment-only); else person∩band.
-    Always subtract skin so the face/arms are protected."""
+    """Per-frame garment mask. Prefer the human-parsing SegFormer (clean garment
+    classes); else rembg cloth-seg / person∩band. Always protect skin."""
+    h, w = frame_bgr.shape[:2]
+    # 1) best path: SegFormer human parsing — already excludes hair/skin/bg.
+    seg = _segformer_clothes_mask(frame_bgr, region)
+    if seg is not None and int((seg > 0).sum()) > 0.003 * h * w:
+        return cv2.morphologyEx(seg, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+    return _clothes_mask_fallback(frame_bgr, region)
+
+
+def _clothes_mask_fallback(frame_bgr: np.ndarray, region: str = "upper") -> np.ndarray:
+    """rembg cloth-seg (or person∩band) fallback when SegFormer isn't available."""
     h, w = frame_bgr.shape[:2]
     band = _region_band(h, w, region)
     person = person_mask(frame_bgr)

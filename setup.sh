@@ -132,6 +132,22 @@ except Exception as e:
     print("    SD prefetch skipped (will lazy-load):", e)
 PY
 
+# Pre-fetch the clothes human-parsing SegFormer (clean garment masks for
+# recolor / garment-replace). ~100MB; non-fatal — falls back to rembg cloth-seg.
+CLOTHES_SEG_MODEL="${CLOTHES_SEG_MODEL:-mattmdjaga/segformer_b2_clothes}"
+export CLOTHES_SEG_MODEL
+echo "==> prefetch clothes SegFormer (${CLOTHES_SEG_MODEL})"
+python - <<'PY'
+import os
+mid = os.environ.get("CLOTHES_SEG_MODEL")
+try:
+    from huggingface_hub import snapshot_download
+    snapshot_download(mid, allow_patterns=["*.json","*.txt","*.safetensors","*.bin","*.model"])
+    print("    cached", mid)
+except Exception as e:
+    print("    clothes SegFormer prefetch skipped (will lazy-load):", e)
+PY
+
 mkdir -p /tmp/uploads /tmp/outputs
 
 # onnxruntime-gpu needs libcudnn.so.8 / libcublas, which this image keeps inside
