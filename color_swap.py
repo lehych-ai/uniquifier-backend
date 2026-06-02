@@ -145,29 +145,44 @@ def person_mask(frame_bgr: np.ndarray) -> np.ndarray:
 
 
 def _region_band(h: int, w: int, region: str) -> np.ndarray:
+    # Bands target the TORSO (below the head) so a "recolor" never lands on the
+    # face. "upper" = chest/shirt, "lower" = pants area, "full" = whole torso+legs.
     band = np.zeros((h, w), np.uint8)
     if region == "upper":
-        band[int(h * 0.18):int(h * 0.58), :] = 255
+        band[int(h * 0.40):int(h * 0.80), :] = 255
     elif region == "lower":
-        band[int(h * 0.52):int(h * 0.92), :] = 255
+        band[int(h * 0.62):int(h * 0.97), :] = 255
     else:
-        band[int(h * 0.15):int(h * 0.95), :] = 255
+        band[int(h * 0.38):int(h * 0.97), :] = 255
     return band
 
 
+def _skin_mask(frame_bgr: np.ndarray) -> np.ndarray:
+    """Skin pixels (YCrCb) — subtracted from the garment mask so face/neck/arms
+    are never recolored even if the band/segmentation overlaps them."""
+    ycrcb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2YCrCb)
+    skin = cv2.inRange(ycrcb, np.array([0, 133, 77], np.uint8), np.array([255, 173, 127], np.uint8))
+    return cv2.dilate(skin, np.ones((5, 5), np.uint8), iterations=2)
+
+
 def clothes_mask(frame_bgr: np.ndarray, region: str = "upper") -> np.ndarray:
-    """Per-frame garment mask. Uses cloth-seg if available, else person∩band."""
+    """Per-frame garment mask. Prefer cloth-seg (garment-only); else person∩band.
+    Always subtract skin so the face/arms are protected."""
     h, w = frame_bgr.shape[:2]
     band = _region_band(h, w, region)
+    base = None
     sess = _get_cloth_session()
     if sess is not None:
         alpha = _rembg_alpha(sess, frame_bgr)
-        mask = cv2.bitwise_and(alpha, band)
-        if mask.max() > 10:
-            return mask
-    # fallback: person silhouette intersected with the region band
-    pm = person_mask(frame_bgr)
-    return cv2.bitwise_and(pm, band)
+        # cloth-seg already isolates garments — use it directly if it found enough.
+        if int((alpha > 30).sum()) > 0.01 * h * w:
+            base = alpha
+    if base is None:
+        # fallback: person silhouette ∩ torso band
+        base = cv2.bitwise_and(person_mask(frame_bgr), band)
+    # never recolor skin (face/neck/arms)
+    base = cv2.bitwise_and(base, cv2.bitwise_not(_skin_mask(frame_bgr)))
+    return base
 
 
 def _feather(mask: np.ndarray, k: int = 9) -> np.ndarray:
