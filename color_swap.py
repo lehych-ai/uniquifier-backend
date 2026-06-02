@@ -310,8 +310,12 @@ def color_swap_preview(frame_path, output_path, plan_save_path, mode, region, pr
         prompt_en = translate_prompt(prompt) or "new stylish outfit"
         mask = clothes_mask(image, region)
         garment = _sd_inpaint(image, mask, prompt_en)
+        # Composite the ACTUAL inpainted garment into the masked region (feathered)
+        # so the preview shows a real garment change, not just a tint. The video
+        # pass still LAB-transfers this look per frame for temporal stability.
+        a = _feather(mask, k=6)[..., None]
+        result = (garment.astype(np.float32) * a + image.astype(np.float32) * (1 - a)).astype(np.uint8)
         means, stds = _lab_stats(garment, mask)
-        result = lab_transfer(image, mask, (means, stds))
         np.savez(plan_save_path, mode=mode, region=region,
                  lab_mean=np.array(means), lab_std=np.array(stds))
 
