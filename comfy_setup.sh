@@ -146,4 +146,10 @@ else
 fi
 echo "================================================="
 echo "==> launching ComfyUI on :$PORT"
+# mkl-service (pulled in with numpy) defaults MKL_THREADING_LAYER=INTEL, which
+# clashes with libgomp (OpenMP) and aborts the launch:
+#   "MKL_THREADING_LAYER=INTEL is incompatible with libgomp.so.1".
+# Force GNU threading (compatible with libgomp) so ComfyUI/torch import cleanly.
+export MKL_THREADING_LAYER=GNU
+export MKL_SERVICE_FORCE_INTEL=0
 exec python main.py --listen 0.0.0.0 --port "$PORT"
