@@ -25,23 +25,33 @@ apt-get install -y --no-install-recommends \
   build-essential python3-dev \
   ffmpeg git wget curl xz-utils libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev
 
-# The image's /usr/bin/ffmpeg is a minimal build with libopenh264 but NO libx264
-# (libopenh264 rejects -preset/-crf and looks worse). Drop in a static ffmpeg
-# that has libx264 so the encoder is top-quality and consistent across hosts.
-echo "==> static ffmpeg (libx264)"
+# The image's /usr/bin/ffmpeg is a minimal build with a BROKEN libopenh264 and
+# NO libx264 ("Incorrect library version loaded"). Drop in a static ffmpeg that
+# has libx264 (and h264_nvenc for the 4090) so encode quality is top-tier and
+# consistent across hosts. BtbN's GitHub builds are reliable to fetch from pods.
+echo "==> static ffmpeg (libx264 + nvenc)"
 if ! /usr/local/bin/ffmpeg -hide_banner -encoders 2>/dev/null | grep -q ' libx264 '; then
   TMPF=/tmp/ffmpeg-static.tar.xz
-  if wget -q -O "$TMPF" https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz; then
-    mkdir -p /tmp/ffx && tar -xf "$TMPF" -C /tmp/ffx --strip-components=1 \
-      && cp -f /tmp/ffx/ffmpeg /tmp/ffx/ffprobe /usr/local/bin/ \
-      && chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe \
-      && echo "    static ffmpeg installed" || echo "    static ffmpeg extract failed (will use system ffmpeg)"
-  else
-    echo "    static ffmpeg download failed (will use system ffmpeg)"
-  fi
+  URLS="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+  for U in $URLS; do
+    echo "    trying $U"
+    if wget -q --tries=3 --timeout=60 -O "$TMPF" "$U"; then
+      rm -rf /tmp/ffx && mkdir -p /tmp/ffx && tar -xf "$TMPF" -C /tmp/ffx 2>/dev/null || true
+      FB="$(find /tmp/ffx -type f -name ffmpeg | head -1)"
+      FP="$(find /tmp/ffx -type f -name ffprobe | head -1)"
+      if [ -n "$FB" ]; then
+        cp -f "$FB" /usr/local/bin/ffmpeg && chmod +x /usr/local/bin/ffmpeg
+        [ -n "$FP" ] && cp -f "$FP" /usr/local/bin/ffprobe && chmod +x /usr/local/bin/ffprobe
+        echo "    static ffmpeg installed from $U"
+        break
+      fi
+    fi
+    echo "    failed $U"
+  done
 else
   echo "    static ffmpeg already present"
 fi
+echo "    /usr/local/bin/ffmpeg encoders: $(/usr/local/bin/ffmpeg -hide_banner -encoders 2>/dev/null | grep -oE 'libx264|h264_nvenc|libopenh264' | tr '\n' ' ' || echo none)"
 
 echo "==> code"
 # Force the working tree to exactly match the latest remote main. The old
