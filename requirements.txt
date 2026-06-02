@@ -18,10 +18,12 @@ Pillow
 numpy<2
 
 # background / clothes generation
-diffusers
-transformers
-accelerate
-huggingface_hub
+# diffusers/transformers pinned to a torch-2.1-compatible era: newer diffusers
+# imports torch.xpu (Intel), which doesn't exist in torch 2.1.0 → import crash.
+diffusers==0.27.2
+transformers==4.39.3
+accelerate==0.29.3
+huggingface_hub<0.26
 # xformers intentionally omitted: its wheels pin an exact torch build and a
 # mismatch makes diffusers fail to import. We enable memory-efficient/sliced
 # attention at runtime instead (see color_swap._get_inpaint_pipe).

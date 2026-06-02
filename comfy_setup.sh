@@ -128,8 +128,8 @@ PY
 
 # ComfyUI/node pip installs may have pulled numpy 2.x — force it back below 2 so
 # torch/insightface/onnxruntime keep their ABI ("_ARRAY_API not found" otherwise).
-echo "==> pinning numpy<2 (shared with the inswapper backend)"
-pip install -q "numpy<2" || true
+echo "==> pinning numpy<2 + diffusers (shared env with the inswapper/color backend)"
+pip install -q "numpy<2" "diffusers==0.27.2" "huggingface_hub<0.26" || true
 
 echo "==> wiring cuDNN onto LD_LIBRARY_PATH (onnxruntime for FaceID)"
 CUDNN_LIB="$(find /opt/conda -name 'libcudnn.so.8*' 2>/dev/null | head -1)"
