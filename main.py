@@ -465,3 +465,16 @@ def admin_redeploy(_=Depends(require_token)):
     )
     subprocess.Popen(["bash", "-c", script], start_new_session=True)
     return {"restarting": True}
+
+
+@app.get("/api/admin/log")
+def admin_log(lines: int = 120, _=Depends(require_token)):
+    """Tail the backend's own stdout/stderr (uvicorn + tracebacks) so I can debug
+    route 500s (e.g. the color-swap failure) without a terminal."""
+    for path in ("/root/setup.log", "/root/onstart.log"):
+        try:
+            with open(path, errors="replace") as f:
+                return {"path": path, "log": "".join(f.readlines()[-lines:])}
+        except FileNotFoundError:
+            continue
+    return {"path": None, "log": ""}
