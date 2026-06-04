@@ -60,6 +60,11 @@ clone_node https://github.com/cubiq/ComfyUI_essentials
 pip install "numpy<2" opencv-python imageio-ffmpeg onnxruntime-gpu segment-anything \
   accelerate sentencepiece ftfy einops 2>&1 | tail -1 || true
 
+# headless chromium for UI→API workflow conversion (ComfyUI's own graphToPrompt)
+LOG "playwright + chromium (for workflow conversion)"
+pip install playwright 2>&1 | tail -1 || true
+python -m playwright install --with-deps chromium 2>&1 | tail -2 || true
+
 # ── models → ComfyUI/models/<subdir> (resumable) ──────────────────────────────
 dl(){  # dl <url> <subdir>
   local url="$1" sub="$2" dir="$COMFY_DIR/models/$2" fn
