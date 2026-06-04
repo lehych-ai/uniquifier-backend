@@ -1,34 +1,10 @@
+# Minimal backend deps. The heavy lifting (Flux.2 + Wan2.2) runs inside ComfyUI,
+# which brings its own torch/diffusers/etc. via comfy_setup.sh. The FastAPI
+# backend only orchestrates: extract a frame, drive ComfyUI over HTTP, serve files.
 fastapi
 uvicorn[standard]
 python-multipart
-
-# face swap
-insightface==0.7.3
-onnxruntime-gpu==1.16.3
-
-# face restoration (optional at runtime — guarded import)
-gfpgan==1.3.8
-
-# segmentation / matting
-rembg[gpu]
-opencv-python-headless
-Pillow
-# onnxruntime / insightface / basicsr wheels are built against NumPy 1.x — NumPy
-# 2.x breaks their ABI ("_ARRAY_API not found"). Pin below 2.
-numpy<2
-
-# background / clothes generation
-# diffusers/transformers pinned to a torch-2.1-compatible era: newer diffusers
-# imports torch.xpu (Intel), which doesn't exist in torch 2.1.0 → import crash.
-diffusers==0.27.2
-transformers==4.39.3
-accelerate==0.29.3
-huggingface_hub<0.26
-# xformers intentionally omitted: its wheels pin an exact torch build and a
-# mismatch makes diffusers fail to import. We enable memory-efficient/sliced
-# attention at runtime instead (see color_swap._get_inpaint_pipe).
-
-# prompt translation
-deep-translator
-
+httpx
 requests
+Pillow
+sse-starlette

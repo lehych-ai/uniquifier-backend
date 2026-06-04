@@ -1,0 +1,21 @@
+# url|comfyui_models_subdir   — downloaded by comfy_setup.sh into ComfyUI/models/<subdir>
+# Wan 2.2 Animate (video gen)
+https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_animate_14B_bf16.safetensors|diffusion_models
+https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Wan2_1_VAE_bf16.safetensors|vae
+https://huggingface.co/lehychh/Wan-animate-v2v/resolve/main/clip/umt5_xxl_fp16.safetensors|text_encoders
+https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors|loras
+https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Lightx2v/lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank256_bf16.safetensors|loras
+https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Pusa/Wan21_PusaV1_LoRA_14B_rank512_bf16.safetensors|loras
+https://huggingface.co/alibaba-pai/Wan2.2-Fun-Reward-LoRAs/resolve/main/Wan2.2-Fun-A14B-InP-low-noise-MPS.safetensors|loras
+https://huggingface.co/lehychh/Wan-animate-v2v/resolve/main/loras/Wan2.2%20SolarFlint_L2.safetensors|loras
+https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/loras/wan2.2_animate_14B_relight_lora_bf16.safetensors|loras
+https://huggingface.co/lehychh/Wan-animate-v2v/resolve/main/detection/vitpose_h_wholebody_model.onnx|detection
+https://huggingface.co/lehychh/Wan-animate-v2v/resolve/main/detection/vitpose_h_wholebody_data.bin|detection
+https://huggingface.co/lehychh/Wan-animate-v2v/resolve/main/detection/yolov10m.onnx|detection
+https://huggingface.co/lehychh/Wan-animate-v2v/resolve/main/controlnet/Wan21_Uni3C_controlnet_fp16.safetensors|controlnet
+https://huggingface.co/lehychh/Wan-animate-v2v/resolve/main/clip_vision/clip_vision_h.safetensors|clip_vision
+# Flux.2 Klein (first-frame image edit)
+https://huggingface.co/lehychh/Flux-swap-i2i/resolve/main/diffusion_models/flux4b.safetensors|diffusion_models
+https://huggingface.co/lehychh/Flux-swap-i2i/resolve/main/text_encoders/qwen.safetensors|text_encoders
+https://huggingface.co/lehychh/Flux-swap-i2i/resolve/main/vae/flux2-vae.safetensors|vae
+https://huggingface.co/Alissonerdx/BFS-Best-Face-Swap/resolve/main/bfs_head_v1_flux-klein_9b_step3500_rank128.safetensors|loras

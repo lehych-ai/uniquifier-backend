@@ -1,21 +1,21 @@
-"""CloserAI GPU backend — FastAPI server that runs on a Vast.ai pod.
+"""Uniquifier GPU backend — FastAPI orchestrator on a Vast pod.
 
-Contract (consumed by the desktop sidecar's VastBackend):
+New stack (2026-06): drives ComfyUI workflows instead of in-process SD.
+  Flux.2 Klein  → first-frame edits (head swap / clothes / bg / color)
+  Wan 2.2 Animate (Kijai WanVideoWrapper) → full video gen (movement/static)
 
-  GET  /api/status                      -> health + which weights are present
-  POST /api/extract-frame   (video)     -> {video_id, frame_url}
-  POST /api/color-swap-preview (form)   -> image/jpeg  (+ saves a reusable plan)
-  POST /api/color-swap-video  (form)    -> {job_id, status:"started"}
-  POST /api/face-swap-preview (face)    -> image/jpeg
-  POST /api/face-swap-video   (form)    -> {job_id, status:"started"}
-  GET  /api/progress/{video_id}         -> {percent, status, output_url?, error?}
-  GET  /files/{kind}/{name}             -> serve uploaded/generated files
+Contract:
+  GET  /api/version                      -> git HEAD of running code
+  GET  /api/status                       -> health + comfy state
+  POST /api/extract-frame   (video)      -> {video_id, frame_url}   (stores src.mp4 + frame0.jpg)
+  POST /api/flux-edit        (form)      -> edited first frame (image/jpeg)
+  POST /api/wan-animate      (json)      -> {status:"started"}  (poll /api/progress)
+  GET  /api/progress/{video_id}          -> {percent,status,output_url?,error?}
+  GET  /files/{kind}/{name}              -> serve uploaded/generated files
+  comfy control: /api/comfy/{install,log,diag,nodes,node,prompt,result}
+  admin: /api/admin/{redeploy,log}
 
-Long jobs run on a background thread and report into PROGRESS so the sidecar can
-poll /api/progress and forward it to the renderer over SSE — no blocking POST.
-
-Set API_TOKEN to require `Authorization: Bearer <token>` on every /api route;
-leave it unset for open access (e.g. behind a private Vast proxy).
+Long jobs run on a thread + report into PROGRESS (no blocking POST).
 """
 from __future__ import annotations
 
@@ -38,13 +38,10 @@ API_TOKEN = os.environ.get("API_TOKEN", "").strip()
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# video_id -> {"percent": float, "status": str, "output_url": str|None, "error": str|None}
 PROGRESS: dict[str, dict] = {}
 
-app = FastAPI(title="CloserAI GPU backend", version="1.0.0")
-app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
-)
+app = FastAPI(title="Uniquifier GPU backend", version="2.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
 def require_token(authorization: str | None = Header(default=None)) -> None:
@@ -64,16 +61,14 @@ def _set_progress(video_id: str, percent: float, status: str, **extra) -> None:
 
 
 # ─────────────────────────────────────────
-# status / files
+# status / version / files
 # ─────────────────────────────────────────
 
 @app.get("/api/version")
 def version():
-    """Short git HEAD of the code the backend is actually running — confirms a
-    redeploy really took (the old shallow `git pull` used to silently no-op)."""
     try:
-        h = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
-                            capture_output=True, text=True, cwd=os.path.dirname(__file__) or ".").stdout.strip()
+        h = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True,
+                           text=True, cwd=os.path.dirname(__file__) or ".").stdout.strip()
     except Exception:  # noqa: BLE001
         h = "unknown"
     return {"head": h}
@@ -81,20 +76,14 @@ def version():
 
 @app.get("/api/status")
 def status():
-    import face_swap
-    import color_swap
     gpu = False
     try:
         import torch
         gpu = torch.cuda.is_available()
-    except Exception:
+    except Exception:  # noqa: BLE001
         pass
-    return {
-        "status": "ok",
-        "gpu": gpu,
-        "models": {**face_swap.models_status(), **color_swap.models_status()},
-        "auth": bool(API_TOKEN),
-    }
+    return {"status": "ok", "gpu": gpu, "comfy_up": _port_open(8188),
+            "comfy_installing": _comfy_running(), "auth": bool(API_TOKEN)}
 
 
 @app.get("/files/{kind}/{name}")
@@ -112,195 +101,78 @@ def serve_file(kind: str, name: str):
 
 @app.post("/api/extract-frame")
 def extract_frame(video: UploadFile = File(...), _=Depends(require_token)):
-    # NB: sync `def` route — FastAPI runs it in a threadpool, so the heavy ffmpeg
-    # call never blocks uvicorn's event loop (an async route doing blocking work
-    # freezes the whole server). Use the sync .file handle, not await .read().
     video_id = uuid.uuid4().hex[:16]
     video_path = _up(video_id, "src.mp4")
     frame_path = _up(video_id, "frame0.jpg")
     with open(video_path, "wb") as f:
         shutil.copyfileobj(video.file, f)
-    subprocess.run(
-        ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-         "-i", video_path, "-frames:v", "1", "-q:v", "2", frame_path],
-        check=False,
-    )
+    subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    "-i", video_path, "-frames:v", "1", "-q:v", "2", frame_path], check=False)
     return {"video_id": video_id, "frame_url": f"/files/uploads/{video_id}_frame0.jpg"}
 
 
-# ─────────────────────────────────────────
-# color swap
-# ─────────────────────────────────────────
-
-def _color_mode(random_color: bool, random_clothes: bool, random_bg: bool) -> str:
-    if random_bg:
-        return "random_bg"
-    if random_clothes:
-        return "random_clothes"
-    return "random_color"
-
-
-def _color_region(upper: bool, lower: bool, full: bool) -> str:
-    if full:
-        return "full"
-    if lower:
-        return "lower"
-    return "upper"
-
-
-@app.post("/api/color-swap-preview")
-def color_swap_preview_route(
-    video_id: str = Form(...),
-    random_color: bool = Form(False),
-    random_clothes: bool = Form(False),
-    random_bg: bool = Form(False),
-    upper_clothes: bool = Form(False),
-    lower_clothes: bool = Form(False),
-    full_outfit: bool = Form(False),
-    prompt_upper: str = Form(""),
-    prompt_lower: str = Form(""),
-    prompt_full: str = Form(""),
-    seed: int | None = Form(None),
-    _=Depends(require_token),
-):
-    from color_swap import color_swap_preview
-
-    mode = _color_mode(random_color, random_clothes, random_bg)
-    region = _color_region(upper_clothes, lower_clothes, full_outfit)
-    prompt = {"upper": prompt_upper, "lower": prompt_lower, "full": prompt_full}[region]
-
-    out = _up(video_id, "color_preview.jpg")
-    plan = _up(video_id, "color_plan.npz")
-    color_swap_preview(
-        frame_path=_up(video_id, "frame0.jpg"),
-        output_path=out,
-        plan_save_path=plan,
-        mode=mode, region=region, prompt=prompt, seed=seed,
-    )
-    return FileResponse(out, media_type="image/jpeg")
-
-
-@app.post("/api/color-swap-video")
-def color_swap_video_route(video_id: str = Form(...), _=Depends(require_token)):
-    from color_swap import color_swap_video
-
-    src = _up(video_id, "src.mp4")
-    plan = _up(video_id, "color_plan.npz")
-    if not os.path.isfile(plan):
-        raise HTTPException(400, "run color-swap-preview first (no plan found)")
-    out = os.path.join(OUTPUT_DIR, f"{video_id}_color.mp4")
-    job_id = uuid.uuid4().hex[:12]
-
-    def work():
-        _set_progress(video_id, 0.0, "running")
-        try:
-            color_swap_video(src, out, plan,
-                             on_progress=lambda p, m: _set_progress(video_id, p, "running"))
-            PROGRESS[video_id] = {"percent": 1.0, "status": "done",
-                                  "output_url": f"/files/outputs/{video_id}_color.mp4", "error": None}
-        except Exception as exc:  # noqa: BLE001
-            PROGRESS[video_id] = {"percent": 0.0, "status": "failed", "output_url": None, "error": str(exc)}
-
-    threading.Thread(target=work, daemon=True).start()
-    return {"job_id": job_id, "video_id": video_id, "status": "started"}
-
-
-# ─────────────────────────────────────────
-# face swap
-# ─────────────────────────────────────────
-
 @app.post("/api/upload-face")
 def upload_face(video_id: str = Form(...), face: UploadFile = File(...), _=Depends(require_token)):
-    """Store the reference face only — no inference. Used by head-swap (and any
-    flow that just needs the face on disk) so it doesn't pay the inswapper cold
-    load just to upload a file."""
     face_path = _up(video_id, "face.jpg")
     with open(face_path, "wb") as f:
         shutil.copyfileobj(face.file, f)
     return {"video_id": video_id, "stored": True}
 
 
-@app.post("/api/face-swap-preview")
-def face_swap_preview_route(
-    video_id: str = Form(...),
-    swap_all: bool = Form(False),
-    enhance: bool = Form(True),
-    face: UploadFile = File(...),
-    _=Depends(require_token),
-):
-    # sync `def` so the blocking inswapper run executes in a threadpool, not on
-    # the event loop (that hang froze the whole server).
-    from face_swap import face_swap_preview
-
-    face_path = _up(video_id, "face.jpg")
-    with open(face_path, "wb") as f:
-        shutil.copyfileobj(face.file, f)
-    out = _up(video_id, "face_preview.jpg")
-    face_swap_preview(_up(video_id, "frame0.jpg"), face_path, out, swap_all=swap_all, enhance=enhance)
-    return FileResponse(out, media_type="image/jpeg")
-
-
-@app.post("/api/face-swap-video")
-def face_swap_video_route(
-    video_id: str = Form(...),
-    swap_all: bool = Form(False),
-    skip_frames: int = Form(0),
-    enhance: bool = Form(True),
-    _=Depends(require_token),
-):
-    from face_swap import face_swap_video
-
-    src = _up(video_id, "src.mp4")
-    face_path = _up(video_id, "face.jpg")
-    if not os.path.isfile(face_path):
-        raise HTTPException(400, "run face-swap-preview first (no face uploaded)")
-    out = os.path.join(OUTPUT_DIR, f"{video_id}_face.mp4")
-    job_id = uuid.uuid4().hex[:12]
-
-    def work():
-        _set_progress(video_id, 0.0, "running")
-        try:
-            face_swap_video(src, face_path, out, swap_all=swap_all, skip_frames=skip_frames,
-                            enhance=enhance,
-                            on_progress=lambda p, m: _set_progress(video_id, p, "running"))
-            PROGRESS[video_id] = {"percent": 1.0, "status": "done",
-                                  "output_url": f"/files/outputs/{video_id}_face.mp4", "error": None}
-        except Exception as exc:  # noqa: BLE001
-            PROGRESS[video_id] = {"percent": 0.0, "status": "failed", "output_url": None, "error": str(exc)}
-
-    threading.Thread(target=work, daemon=True).start()
-    return {"job_id": job_id, "video_id": video_id, "status": "started"}
-
-
 # ─────────────────────────────────────────
-# full head + hair swap (ComfyUI / AnimateDiff)
+# Flux first-frame edit + Wan video gen  (filled in by workflows.py)
 # ─────────────────────────────────────────
 
-@app.post("/api/head-swap-video")
-async def head_swap_video_route(req: Request, _=Depends(require_token)):
-    import headswap
+@app.post("/api/flux-edit")
+def flux_edit(video_id: str = Form(...), kind: str = Form("face"), prompt: str = Form(""),
+              region: str = Form(""), face: UploadFile | None = File(default=None),
+              _=Depends(require_token)):
+    import workflows
+    frame = _up(video_id, "frame0.jpg")
+    if not os.path.isfile(frame):
+        raise HTTPException(400, "no first frame; call /api/extract-frame first")
+    face_path = None
+    if face is not None:
+        face_path = _up(video_id, "face.jpg")
+        with open(face_path, "wb") as f:
+            shutil.copyfileobj(face.file, f)
+    elif kind == "face":
+        face_path = _up(video_id, "face.jpg")
+        if not os.path.isfile(face_path):
+            raise HTTPException(400, "face kind needs a reference face (upload-face or face field)")
+    out = _up(video_id, "edited.png")
+    try:
+        workflows.run_flux_edit(kind=kind, frame_path=frame, face_path=face_path,
+                                prompt=prompt, region=region, out_path=out)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"flux edit failed: {exc}")
+    return FileResponse(out, media_type="image/png")
 
+
+@app.post("/api/wan-animate")
+async def wan_animate(req: Request, _=Depends(require_token)):
+    import workflows
     body = await req.json()
     video_id = body.get("video_id", "")
+    bg_source = body.get("bg_source", "movement")  # movement | static
     params = body.get("params", {}) or {}
     src = _up(video_id, "src.mp4")
-    face = _up(video_id, "face.jpg")
+    edited = _up(video_id, "edited.png")
     if not os.path.isfile(src):
-        raise HTTPException(400, "no source video for this id (upload via /api/extract-frame)")
-    if not os.path.isfile(face):
-        raise HTTPException(400, "no face for this id (upload via /api/face-swap-preview)")
-    out_final = os.path.join(OUTPUT_DIR, f"{video_id}_head.mp4")
+        raise HTTPException(400, "no source video for this id")
+    if not os.path.isfile(edited):
+        raise HTTPException(400, "no edited first frame; run /api/flux-edit first")
+    out_final = os.path.join(OUTPUT_DIR, f"{video_id}_wan.mp4")
 
     def work():
         _set_progress(video_id, 0.0, "running")
         try:
-            out = headswap.run_head_swap(
-                src, face, params,
-                on_progress=lambda p, m: _set_progress(video_id, p, "running"),
-            )
+            out = workflows.run_wan_animate(src_video=src, ref_image=edited, bg_source=bg_source,
+                                            params=params,
+                                            on_progress=lambda p, m: _set_progress(video_id, p, "running", msg=m))
             shutil.copy2(out, out_final)
             PROGRESS[video_id] = {"percent": 1.0, "status": "done",
-                                  "output_url": f"/files/outputs/{video_id}_head.mp4", "error": None}
+                                  "output_url": f"/files/outputs/{video_id}_wan.mp4", "error": None}
         except Exception as exc:  # noqa: BLE001
             PROGRESS[video_id] = {"percent": 0.0, "status": "failed", "output_url": None, "error": str(exc)}
 
@@ -308,26 +180,19 @@ async def head_swap_video_route(req: Request, _=Depends(require_token)):
     return {"video_id": video_id, "status": "started"}
 
 
-# ─────────────────────────────────────────
-# progress
-# ─────────────────────────────────────────
-
 @app.get("/api/progress/{video_id}")
 def progress(video_id: str, _=Depends(require_token)):
     return PROGRESS.get(video_id, {"percent": 0.0, "status": "unknown", "output_url": None, "error": None})
 
 
 # ─────────────────────────────────────────
-# ComfyUI control plane (drive the head-swap engine over HTTP, no terminal/SSH)
-#
-# Narrow surface — NOT arbitrary exec: install runs a fixed script, log tails a
-# fixed file, diag lists fixed dirs. All gated behind the API token.
+# ComfyUI control plane
 # ─────────────────────────────────────────
 
 COMFY_DIR = os.environ.get("COMFY_DIR", "/root/ComfyUI")
 COMFY_LOG = "/root/comfy.log"
-COMFY_SETUP = "/root/comfy_setup.sh"
-COMFY_SETUP_URL = "https://raw.githubusercontent.com/lehych-ai/uniquifier-backend/main/comfy_setup.sh"
+COMFY_SETUP = os.path.join(os.path.dirname(__file__) or ".", "comfy_setup.sh")
+COMFY_API = "http://127.0.0.1:8188"
 
 
 def _comfy_running() -> bool:
@@ -336,12 +201,10 @@ def _comfy_running() -> bool:
 
 def _port_open(port: int) -> bool:
     import socket
-    s = socket.socket()
-    s.settimeout(1.0)
+    s = socket.socket(); s.settimeout(1.0)
     try:
-        s.connect(("127.0.0.1", port))
-        return True
-    except Exception:
+        s.connect(("127.0.0.1", port)); return True
+    except Exception:  # noqa: BLE001
         return False
     finally:
         s.close()
@@ -349,69 +212,47 @@ def _port_open(port: int) -> bool:
 
 @app.post("/api/comfy/install")
 def comfy_install(_=Depends(require_token)):
-    """Pull the latest comfy_setup.sh and run it in the background (idempotent)."""
     if _comfy_running():
         return {"started": False, "reason": "comfy_setup already running"}
-    subprocess.run(["wget", "-qO", COMFY_SETUP, COMFY_SETUP_URL], check=False)
-    logf = open(COMFY_LOG, "w")
-    subprocess.Popen(["bash", COMFY_SETUP], stdout=logf, stderr=subprocess.STDOUT,
-                     start_new_session=True)
+    logf = open(COMFY_LOG, "a")
+    subprocess.Popen(["bash", COMFY_SETUP], stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
     return {"started": True}
 
 
 @app.get("/api/comfy/log")
-def comfy_log(lines: int = 120, _=Depends(require_token)):
+def comfy_log(lines: int = 160, _=Depends(require_token)):
     try:
         with open(COMFY_LOG, errors="replace") as f:
-            tail = f.readlines()[-lines:]
-        return {"log": "".join(tail), "installing": _comfy_running()}
+            return {"log": "".join(f.readlines()[-lines:]), "installing": _comfy_running(), "up": _port_open(8188)}
     except FileNotFoundError:
-        return {"log": "", "installing": _comfy_running()}
+        return {"log": "", "installing": _comfy_running(), "up": _port_open(8188)}
 
 
 @app.get("/api/comfy/diag")
 def comfy_diag(_=Depends(require_token)):
-    def ls(p: str) -> list[str]:
+    def ls(p):
         try:
             return sorted(os.listdir(p))
-        except Exception:
+        except Exception:  # noqa: BLE001
             return []
     m = os.path.join(COMFY_DIR, "models")
-    return {
-        "comfy_up": _port_open(8188),
-        "installing": _comfy_running(),
-        "nodes": ls(os.path.join(COMFY_DIR, "custom_nodes")),
-        "models": {
-            "checkpoints": ls(os.path.join(m, "checkpoints")),
-            "vae": ls(os.path.join(m, "vae")),
-            "animatediff_models": ls(os.path.join(m, "animatediff_models")),
-            "controlnet": ls(os.path.join(m, "controlnet")),
-            "ipadapter": ls(os.path.join(m, "ipadapter")),
-            "clip_vision": ls(os.path.join(m, "clip_vision")),
-            "loras": ls(os.path.join(m, "loras")),
-            "insightface": ls(os.path.join(m, "insightface", "models")),
-        },
-    }
-
-
-# ---- proxy to the local ComfyUI server (8188, not publicly exposed) ----
-
-COMFY_API = "http://127.0.0.1:8188"
+    return {"comfy_up": _port_open(8188), "installing": _comfy_running(),
+            "nodes": ls(os.path.join(COMFY_DIR, "custom_nodes")),
+            "models": {k: ls(os.path.join(m, k)) for k in
+                       ("diffusion_models", "vae", "text_encoders", "loras", "controlnet",
+                        "clip_vision", "detection")}}
 
 
 def _comfy_req(path: str, data: bytes | None = None, timeout: float = 30):
-    req = urllib.request.Request(
-        COMFY_API + path, data=data,
-        headers={"Content-Type": "application/json"} if data else {},
-        method="POST" if data else "GET",
-    )
+    req = urllib.request.Request(COMFY_API + path, data=data,
+                                 headers={"Content-Type": "application/json"} if data else {},
+                                 method="POST" if data else "GET")
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read()
 
 
 @app.get("/api/comfy/nodes")
 def comfy_nodes(_=Depends(require_token)):
-    """List installed node class_types — used to author the workflow with exact names."""
     try:
         info = json.loads(_comfy_req("/object_info"))
         return {"count": len(info), "nodes": sorted(info.keys())}
@@ -421,7 +262,6 @@ def comfy_nodes(_=Depends(require_token)):
 
 @app.get("/api/comfy/node/{name}")
 def comfy_node(name: str, _=Depends(require_token)):
-    """Full input schema for one node (so the workflow wires inputs correctly)."""
     try:
         return json.loads(_comfy_req("/object_info/" + name))
     except Exception as exc:  # noqa: BLE001
@@ -430,7 +270,6 @@ def comfy_node(name: str, _=Depends(require_token)):
 
 @app.post("/api/comfy/prompt")
 async def comfy_prompt(req: Request, _=Depends(require_token)):
-    """Forward a workflow ({"prompt": {...}}) to ComfyUI; returns {prompt_id}."""
     body = await req.body()
     try:
         return json.loads(_comfy_req("/prompt", data=body, timeout=60))
@@ -442,7 +281,6 @@ async def comfy_prompt(req: Request, _=Depends(require_token)):
 
 @app.get("/api/comfy/result/{prompt_id}")
 def comfy_result(prompt_id: str, _=Depends(require_token)):
-    """Poll a submitted prompt: returns its /history entry (outputs when done)."""
     try:
         hist = json.loads(_comfy_req("/history/" + prompt_id))
         return hist.get(prompt_id, {"status": "pending"})
@@ -450,14 +288,12 @@ def comfy_result(prompt_id: str, _=Depends(require_token)):
         raise HTTPException(503, f"ComfyUI not reachable: {exc}")
 
 
+# ─────────────────────────────────────────
+# admin
+# ─────────────────────────────────────────
+
 @app.post("/api/admin/redeploy")
 def admin_redeploy(_=Depends(require_token)):
-    """Pull the latest backend code and restart uvicorn (detached, survives our exit).
-    Lets me ship new endpoints without a terminal — the running process can't
-    hot-reload, so we relaunch it via setup.sh."""
-    # NB: the '[u]vicorn' bracket trick stops pkill from matching THIS very command
-    # line (which contains the pattern as a literal) and killing itself before it
-    # can relaunch — otherwise the backend never comes back up.
     script = (
         "sleep 1; pkill -f '[u]vicorn' 2>/dev/null; sleep 1; "
         "wget -qO /root/setup.sh https://raw.githubusercontent.com/lehych-ai/uniquifier-backend/main/setup.sh; "
@@ -468,9 +304,7 @@ def admin_redeploy(_=Depends(require_token)):
 
 
 @app.get("/api/admin/log")
-def admin_log(lines: int = 120, _=Depends(require_token)):
-    """Tail the backend's own stdout/stderr (uvicorn + tracebacks) so I can debug
-    route 500s (e.g. the color-swap failure) without a terminal."""
+def admin_log(lines: int = 160, _=Depends(require_token)):
     for path in ("/root/setup.log", "/root/onstart.log"):
         try:
             with open(path, errors="replace") as f:

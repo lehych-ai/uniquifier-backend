@@ -1,164 +1,42 @@
 #!/usr/bin/env bash
-# Provision a Vast.ai (or any CUDA) pod for the CloserAI GPU backend.
-# Idempotent: safe to re-run. Honors env overrides:
-#   MODELS_DIR (default /root/models), APP_DIR (default /root/app),
-#   PORT (default 8000), API_TOKEN (optional), SD_INPAINT_MODEL.
-set -euo pipefail
+# Provision a Vast pod for the Uniquifier backend (Flux.2 + Wan2.2 via ComfyUI).
+# Idempotent. Boots the FastAPI orchestrator on :8000 and kicks ComfyUI
+# provisioning (comfy_setup.sh) in the background so the pod self-installs.
+set -uo pipefail
 
-MODELS_DIR="${MODELS_DIR:-/root/models}"
 APP_DIR="${APP_DIR:-/root/app}"
 PORT="${PORT:-8000}"
 REPO="${REPO:-https://github.com/lehych-ai/uniquifier-backend}"
 
 echo "==> system packages"
-# Fail fast on a stalled apt mirror (some Vast hosts have a dog-slow link to
-# archive.ubuntu.com) and retry, instead of hanging for 10+ minutes.
-cat > /etc/apt/apt.conf.d/99closerai <<'APT'
-Acquire::Retries "3";
-Acquire::http::Timeout "20";
-Acquire::https::Timeout "20";
-APT
-apt-get update -y
-# build-essential is required: insightface compiles a Cython extension from
-# source, and the pytorch *-runtime images ship without a compiler (no g++).
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y || true
 apt-get install -y --no-install-recommends \
-  build-essential python3-dev \
-  ffmpeg git wget curl xz-utils libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev
-
-# The image's /usr/bin/ffmpeg is a minimal build with a BROKEN libopenh264 and
-# NO libx264 ("Incorrect library version loaded"). Drop in a static ffmpeg that
-# has libx264 (and h264_nvenc for the 4090) so encode quality is top-tier and
-# consistent across hosts. BtbN's GitHub builds are reliable to fetch from pods.
-echo "==> static ffmpeg (libx264 + nvenc)"
-if ! /usr/local/bin/ffmpeg -hide_banner -encoders 2>/dev/null | grep -q ' libx264 '; then
-  TMPF=/tmp/ffmpeg-static.tar.xz
-  URLS="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
-  for U in $URLS; do
-    echo "    trying $U"
-    if wget -q --tries=3 --timeout=60 -O "$TMPF" "$U"; then
-      rm -rf /tmp/ffx && mkdir -p /tmp/ffx && tar -xf "$TMPF" -C /tmp/ffx 2>/dev/null || true
-      FB="$(find /tmp/ffx -type f -name ffmpeg | head -1)"
-      FP="$(find /tmp/ffx -type f -name ffprobe | head -1)"
-      if [ -n "$FB" ]; then
-        cp -f "$FB" /usr/local/bin/ffmpeg && chmod +x /usr/local/bin/ffmpeg
-        [ -n "$FP" ] && cp -f "$FP" /usr/local/bin/ffprobe && chmod +x /usr/local/bin/ffprobe
-        echo "    static ffmpeg installed from $U"
-        break
-      fi
-    fi
-    echo "    failed $U"
-  done
-else
-  echo "    static ffmpeg already present"
-fi
-echo "    /usr/local/bin/ffmpeg encoders: $(/usr/local/bin/ffmpeg -hide_banner -encoders 2>/dev/null | grep -oE 'libx264|h264_nvenc|libopenh264' | tr '\n' ' ' || echo none)"
+  git wget curl aria2 ffmpeg build-essential python3-dev \
+  libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev || true
 
 echo "==> code"
-# Force the working tree to exactly match the latest remote main. The old
-# `pull --ff-only || true` silently FAILED on the shallow clone, so the pod kept
-# running stale code through every redeploy — fetch + hard reset is bulletproof.
 if [ -d "$APP_DIR/.git" ]; then
   git -C "$APP_DIR" fetch --depth 1 origin main || git -C "$APP_DIR" fetch origin main
-  # reset to FETCH_HEAD (exactly what we just fetched) — the origin/main tracking
-  # ref can be stale on a shallow clone, which left the pod on old code.
   git -C "$APP_DIR" reset --hard FETCH_HEAD
 else
   git clone --depth 1 "$REPO" "$APP_DIR"
 fi
 cd "$APP_DIR"
 git rev-parse --short HEAD | sed 's/^/    code @ /'
-# If this script lives in a gpu-backend/ subdir of the desktop repo, use that.
 [ -f "$APP_DIR/gpu-backend/main.py" ] && cd "$APP_DIR/gpu-backend"
 
-echo "==> python deps"
-pip install --upgrade pip
-pip install -r requirements.txt
+echo "==> backend python deps (minimal)"
+pip install --upgrade pip || true
+pip install -r requirements.txt || true
 
-echo "==> model weights -> $MODELS_DIR"
-mkdir -p "$MODELS_DIR"
-
-dl() {  # dl <url> <dest>
-  if [ ! -f "$2" ]; then
-    echo "    downloading $(basename "$2")"
-    wget -q --show-progress -O "$2" "$1"
-  else
-    echo "    have $(basename "$2")"
-  fi
-}
-
-# Face swap: inswapper (~500MB) + GFPGAN restorer (~340MB)
-dl "https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx" \
-   "$MODELS_DIR/inswapper_128.onnx"
-dl "https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth" \
-   "$MODELS_DIR/GFPGANv1.4.pth"
-
-# Pre-fetch the InsightFace detector pack (buffalo_l ~280MB). Without this the
-# first face-swap request stalls while it downloads mid-request.
-echo "==> prefetch insightface buffalo_l"
-python - <<'PY'
-try:
-    from insightface.app import FaceAnalysis
-    FaceAnalysis(name="buffalo_l")  # construction downloads the model pack
-    print("    buffalo_l cached")
-except Exception as e:
-    print("    buffalo_l prefetch skipped (will lazy-load):", e)
-PY
-
-# Warm rembg model cache (person matte + clothes segmentation)
-echo "==> warming rembg models"
-python - <<'PY'
-try:
-    from rembg import new_session
-    new_session("u2net")
-    new_session("u2net_cloth_seg")
-    print("    rembg models cached")
-except Exception as e:
-    print("    rembg warm failed (will lazy-load):", e)
-PY
-
-# Pre-fetch SD inpainting weights. stabilityai/* went gated (HTTP 401), so use a
-# public SD1.5-inpainting mirror by default. Non-fatal — falls back to lazy load.
-SD_INPAINT_MODEL="${SD_INPAINT_MODEL:-botp/stable-diffusion-v1-5-inpainting}"
-export SD_INPAINT_MODEL
-echo "==> prefetch SD inpainting (${SD_INPAINT_MODEL})"
-python - <<'PY'
-import os
-mid = os.environ.get("SD_INPAINT_MODEL")
-try:
-    from huggingface_hub import snapshot_download
-    snapshot_download(mid, allow_patterns=["*.json","*.txt","*.safetensors","*.bin"])
-    print("    cached", mid)
-except Exception as e:
-    print("    SD prefetch skipped (will lazy-load):", e)
-PY
-
-# Pre-fetch the clothes human-parsing SegFormer (clean garment masks for
-# recolor / garment-replace). ~100MB; non-fatal — falls back to rembg cloth-seg.
-CLOTHES_SEG_MODEL="${CLOTHES_SEG_MODEL:-mattmdjaga/segformer_b2_clothes}"
-export CLOTHES_SEG_MODEL
-echo "==> prefetch clothes SegFormer (${CLOTHES_SEG_MODEL})"
-python - <<'PY'
-import os
-mid = os.environ.get("CLOTHES_SEG_MODEL")
-try:
-    from huggingface_hub import snapshot_download
-    snapshot_download(mid, allow_patterns=["*.json","*.txt","*.safetensors","*.bin","*.model"])
-    print("    cached", mid)
-except Exception as e:
-    print("    clothes SegFormer prefetch skipped (will lazy-load):", e)
-PY
-
-mkdir -p /tmp/uploads /tmp/outputs
-
-# onnxruntime-gpu needs libcudnn.so.8 / libcublas, which this image keeps inside
-# torch/conda rather than on the default loader path → "libcudnn.so.8: cannot
-# open shared object file". Locate them and export LD_LIBRARY_PATH before launch.
-echo "==> wiring cuDNN onto LD_LIBRARY_PATH for onnxruntime"
-CUDNN_LIB="$(find /opt/conda -name 'libcudnn.so.8*' 2>/dev/null | head -1)"
-TORCH_LIB="$(python -c 'import torch,os;print(os.path.join(os.path.dirname(torch.__file__),"lib"))' 2>/dev/null || true)"
-export LD_LIBRARY_PATH="${CUDNN_LIB:+$(dirname "$CUDNN_LIB")}:${TORCH_LIB}:/opt/conda/lib:${LD_LIBRARY_PATH:-}"
-echo "    cudnn=$CUDNN_LIB"
-echo "    LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+echo "==> kick ComfyUI provisioning in background (Flux.2 + Wan2.2 + models)"
+# idempotent: comfy_setup is also guarded by /api/comfy/install (pgrep). It runs
+# long (clones nodes + downloads ~70GB) and ends by serving ComfyUI on :8188.
+chmod +x comfy_setup.sh 2>/dev/null || true
+if ! pgrep -f comfy_setup.sh >/dev/null 2>&1; then
+  nohup bash comfy_setup.sh > /root/comfy.log 2>&1 &
+fi
 
 echo "==> launching API on :$PORT"
 exec uvicorn main:app --host 0.0.0.0 --port "$PORT" --workers 1 --log-level info
