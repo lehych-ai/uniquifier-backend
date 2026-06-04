@@ -30,13 +30,11 @@ echo "==> backend python deps (minimal)"
 pip install --upgrade pip || true
 pip install -r requirements.txt || true
 
-echo "==> kick ComfyUI provisioning in background (Flux.2 + Wan2.2 + models)"
-# idempotent: comfy_setup is also guarded by /api/comfy/install (pgrep). It runs
-# long (clones nodes + downloads ~70GB) and ends by serving ComfyUI on :8188.
 chmod +x comfy_setup.sh 2>/dev/null || true
-if ! pgrep -f comfy_setup.sh >/dev/null 2>&1; then
-  nohup bash comfy_setup.sh > /root/comfy.log 2>&1 &
-fi
+# NOTE: ComfyUI provisioning (comfy_setup.sh, ~70GB) is NOT auto-kicked here — we
+# trigger it via POST /api/comfy/install only AFTER confirming the pod's port is
+# reachable, so a host with broken external port mapping is dropped before wasting
+# the huge download.
 
 echo "==> launching API on :$PORT"
 exec uvicorn main:app --host 0.0.0.0 --port "$PORT" --workers 1 --log-level info
